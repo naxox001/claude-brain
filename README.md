@@ -78,7 +78,9 @@ cd visor && python -m http.server 8777   # -> http://localhost:8777
 - **Validar / ver salud:** `node brain.mjs validate` (también corre en cada inicio de sesión vía el hook).
 - **Ver el cerebro:** abre el visor.
 
-El resto ocurre **solo**: el mantenedor semanal y el consolidador nocturno corren en background, **serializados con un lock** y con gates que abortan ante un árbol de trabajo sucio, secretos o cambios fuera de contrato.
+El resto ocurre **solo** (lazo cerrado): un hook `Stop` (`brain.mjs capture`) deposita un puntero de cada sesión en `inbox/` (gitignored, no ensucia el árbol); el **consolidador nocturno** lee esos punteros + sus transcripts y extrae memorias durables a los digests; el **mantenedor semanal** valida, normaliza nodos mal formados, drena la sección Inbox del índice, archiva cerrados y respalda. Todo **serializado con un lock** y con gates que abortan ante un árbol sucio, secretos o cambios fuera de contrato, con auto-rollback.
+
+> **Deferido a propósito** (ver auditorías): aislar el consolidador en un git-worktree para correr aun con WIP de otra sesión presente; flip completo al formato nativo como entrada (medir frecuencia primero); embeddings locales como re-ranker (solo si BM25 resulta insuficiente).
 
 > **Multiusuario / multi-sesión y memoria nativa:** el cerebro vive en el mismo directorio que la memoria automática del harness, que puede escribir nodos sin el formato v3. El hook de inicio corre `validate` y te avisa; corre `normalize` para reparar. Los jobs automáticos nunca tocan trabajo sin commitear de otra sesión.
 

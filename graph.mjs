@@ -151,9 +151,12 @@ function query(text) {
   const db = new DatabaseSync(DB_PATH);
   let rows;
   try {
-    // OR de terminos con prefijo (mejor recall que el AND implicito de FTS5)
-    const ftsQuery = text.split(/\s+/).filter(Boolean).map(t => `"${t.replace(/"/g, '')}"*`).join(' OR ');
-    rows = db.prepare(`SELECT n.id, n.domain, n.status, n.description FROM nodes_fts f JOIN nodes n ON n.id=f.id WHERE nodes_fts MATCH ? ORDER BY rank LIMIT 5`).all(ftsQuery);
+    // PRECISION (audit#3): BM25 con peso por campo (name >> description >> body) + AND-primero, OR como fallback.
+    // El OR-de-prefijos viejo inflaba recall y destruia precision (devolvia ruido por prefijos comunes).
+    const terms = text.split(/\s+/).filter(Boolean).map(t => `"${t.replace(/"/g, '')}"*`);
+    const sel = `SELECT n.id, n.domain, n.status, n.description FROM nodes_fts f JOIN nodes n ON n.id=f.id WHERE nodes_fts MATCH ? ORDER BY bm25(nodes_fts, 0.0, 10.0, 5.0, 1.0) LIMIT 5`;
+    rows = db.prepare(sel).all(terms.join(' AND '));               // AND: alta precision
+    if (!rows.length && terms.length > 1) rows = db.prepare(sel).all(terms.join(' OR ')); // fallback: recall
   } catch {
     const like = `%${text.replace(/\s+/g, '%')}%`;
     rows = db.prepare(`SELECT id, domain, status, description FROM nodes WHERE name LIKE ? OR description LIKE ? LIMIT 5`).all(like, like);

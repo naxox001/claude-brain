@@ -32,21 +32,39 @@ const sh = (cmd, a, opts = {}) => execFileSync(cmd, a, { encoding: 'utf8', ...op
 const SECRET_PATTERNS = [
   ['shopify',  /shpat_[a-zA-Z0-9]{20,}/g],
   ['shopify',  /atkn_[a-zA-Z0-9]{20,}/g],
+  // OpenAI clasica + project + Anthropic + Stripe + HuggingFace (audit#3: el sk- generico no cubria los guiones)
+  ['anthropic', /sk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{20,}/g],
+  ['openai',   /sk-proj-[A-Za-z0-9_-]{20,}/g],
   ['openai',   /sk-[a-zA-Z0-9]{20,}/g],
-  ['github',   /gh[pous]_[A-Za-z0-9]{30,}/g],
+  ['stripe',   /[rs]k_(?:live|test)_[A-Za-z0-9]{20,}/g],
+  ['huggingface', /\bhf_[A-Za-z0-9]{30,}/g],
+  ['resend',   /\bre_[A-Za-z0-9]{8,}_[A-Za-z0-9]{20,}/g],
+  ['github',   /gh[pousr]_[A-Za-z0-9]{30,}/g],
   ['aws',      /AKIA[0-9A-Z]{16}/g],
   ['slack',    /xox[baprs]-[A-Za-z0-9-]{10,}/g],
   ['telegram', /\b\d{8,10}:[A-Za-z0-9_-]{30,}\b/g],
   // hex largo SOLO en contexto de asignacion de secreto (evita falsos positivos con SHA/MD5/hashes de drift)
-  ['secret-hex', /(?:token|secret|key|pass(?:word|wd)?|api[_-]?key)\s*[=:]\s*[`"']?[a-f0-9]{24,}/gi],
+  ['secret-hex', /(?:token|secret|key|pass(?:word|wd)?|api[_-]?key|aws_secret(?:_access_key)?)\s*[=:]\s*[`"']?[A-Za-z0-9/+]{24,}/gi],
   ['bearer',   /Bearer\s+[A-Za-z0-9._-]{20,}/g],
-  // expandido (audit 2026-06-13): claves privadas, JWT, connection strings con password
   ['pem',      /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g],
   ['jwt',      /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g],
   ['connstr',  /(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^:\s]+:[^@\s]+@/gi],
   ['google',   /\bAIza[0-9A-Za-z_-]{35}\b/g],
+  ['google-oauth', /GOCSPX-[A-Za-z0-9_-]{20,}/g],
 ];
+// placeholders SOLO claramente falsos (no '1234' ni '123': aparecen en claves reales -> falso negativo)
+const PLACEHOLDER = /aaaa|bbbb|cccc|xxxx|EXAMPLE|placeholder|your[_-]?(?:key|token|secret)|dummy|redacted|\.\.\./i;
 const redact = s => s.length <= 8 ? s[0] + '***' : s.slice(0, 4) + '***' + s.slice(-2);
+function scanText(text, file, hits, viaB64) {
+  text.split('\n').forEach((line, i) => {
+    for (const [kind, re] of SECRET_PATTERNS) {
+      for (const m of line.matchAll(re)) {
+        if (/\*\*\*/.test(m[0]) || PLACEHOLDER.test(m[0])) continue;
+        hits.push({ file, line: i + 1, kind: viaB64 ? kind + '(base64)' : kind, sample: redact(m[0]) });
+      }
+    }
+  });
+}
 export function secretScan(dir) {
   const hits = [];
   const walk = d => {
@@ -56,15 +74,12 @@ export function secretScan(dir) {
       if (st.isDirectory()) { if (f !== '.git' && f !== 'node_modules') walk(p); continue; }
       if (!/\.(md|txt|json|js|mjs|sh|cmd|ya?ml|toml|pem|key|env|ini|conf)$/i.test(f) && !/^\.env/.test(f)) continue;
       const text = readFileSync(p, 'utf8');
-      text.split('\n').forEach((line, i) => {
-        for (const [kind, re] of SECRET_PATTERNS) {
-          for (const m of line.matchAll(re)) {
-            // ignorar lo ya redactado (prefijo***sufijo) y placeholders obvios
-            if (/\*\*\*/.test(m[0]) || /aaaa|bbbb|xxxx|EXAMPLE|placeholder/i.test(m[0])) continue;
-            hits.push({ file: p.replace(MEM, '.'), line: i + 1, kind, sample: redact(m[0]) });
-          }
-        }
-      });
+      const file = p.replace(MEM, '.');
+      scanText(text, file, hits, false);
+      // heuristica base64 (audit#3): decodifica blobs >=40 chars y re-escanea (secretos ofuscados)
+      for (const m of text.matchAll(/[A-Za-z0-9+/]{40,}={0,2}/g)) {
+        try { const dec = Buffer.from(m[0], 'base64').toString('utf8'); if (/[\x20-\x7e]{12,}/.test(dec)) scanText(dec, file, hits, true); } catch {}
+      }
     }
   };
   walk(dir);
@@ -101,7 +116,23 @@ function run() {
   // 2.5) GATE de arbol-limpio: con WIP de otra sesion NO mutamos (demote/render/commit); solo reportamos + respaldamos.
   let treeClean = true;
   try { treeClean = sh('git', ['-C', MEM, 'status', '--porcelain']).trim() === ''; } catch { treeClean = false; }
-  if (!treeClean) log('working tree SUCIO (WIP de otra sesion) — se omiten demote/render/commit; corren validate+secret+backup');
+  if (!treeClean) log('working tree SUCIO (WIP de otra sesion) — se omiten normalize/drain/demote/render/commit; corren validate+secret+backup');
+
+  // 2.6) NORMALIZE AUTOMATICO (Fase 0): si validate fallo SOLO por nodos no-v3 y el arbol esta limpio, repararlos.
+  //      Cierra el lazo de la memoria nativa sin intervencion humana. Nunca toca nodos que el humano edito.
+  if (treeClean && !validateOk && !DRY) {
+    try {
+      const nout = sh('node', [join(BRAIN, 'brain.mjs'), 'normalize', '--mem', MEM]);
+      log('normalize auto:', nout.trim().split('\n')[0]);
+      try { sh('node', [join(BRAIN, 'brain.mjs'), 'validate', '--mem', MEM]); validateOk = true; report.steps.normalized = true; log('validate OK tras normalize'); }
+      catch { log('validate sigue en rojo tras normalize (errores no-normalizables)'); alert('validate en rojo tras normalize (revisar manual)'); }
+    } catch (e) { log('normalize fallo:', e.message.slice(0, 80)); }
+  }
+
+  // 2.7) DRENAR INBOX (Fase 0): materializa la seccion Inbox de MEMORY.md a inbox/ (la lee el consolidador).
+  if (treeClean && !DRY) {
+    try { const dout = sh('node', [join(BRAIN, 'brain.mjs'), 'drain-inbox', '--mem', MEM]); if (!/vacio|no hay/.test(dout)) { log('drain-inbox:', dout.trim()); report.steps.drained = true; } } catch (e) { log('drain-inbox fallo:', e.message.slice(0, 60)); }
+  }
 
   // 3) auto-demote cerrados >60d (solo si limpio)
   const demoted = [];
@@ -156,18 +187,19 @@ function run() {
   if (!DRY) writeFileSync(join(BRAIN, 'SYSTEM-STATE.md'), stateDoc);
   report.steps.systemState = { nodes, digs, arch, n0, validateOk, treeClean };
 
-  // 9) commit/push — solo si limpio (gate), hubo demote, validate OK y sin secretos. Add file-specifico.
-  if (!DRY && treeClean && demoted.length && validateOk) {
+  // 9) commit/push — solo si limpio (gate) + validate OK + hubo algun cambio del job (demote/normalize/drain).
+  //    add -A es SEGURO aqui: el gate de arbol-limpio garantiza que todo lo dirty lo produjo este job.
+  const huboCambio = demoted.length || report.steps.normalized || report.steps.drained;
+  if (!DRY && treeClean && validateOk && huboCambio) {
     try {
-      sh('git', ['-C', MEM, 'add', '--', 'MEMORY.md']);
-      if (existsSync(join(MEM, 'archivo'))) sh('git', ['-C', MEM, 'add', '--', 'archivo']);
-      for (const f of demoted) { try { sh('git', ['-C', MEM, 'add', '--', f]); } catch {} }
-      sh('git', ['-C', MEM, '-c', 'user.name=brain-maintainer', '-c', 'user.email=brain@local', 'commit', '-q', '-m', `maintain: demote ${demoted.length} cerrados + N0/grafo regenerados (${report.ts.slice(0, 10)})`]);
+      sh('git', ['-C', MEM, 'add', '-A']);
+      const msg = `maintain: ${demoted.length} demote${report.steps.normalized ? ' + normalize' : ''}${report.steps.drained ? ' + drain-inbox' : ''} + N0/grafo (${report.ts.slice(0, 10)})`;
+      sh('git', ['-C', MEM, '-c', 'user.name=brain-maintainer', '-c', 'user.email=brain@local', 'commit', '-q', '-m', msg]);
       if (secrets.length) { report.steps.git = `commit local (push BLOQUEADO: ${secrets.length} secreto(s))`; alert(`push bloqueado por ${secrets.length} secretos`); }
       else { try { sh('git', ['-C', MEM, 'push', '-q', 'origin', 'main']); report.steps.git = 'commit+push'; } catch { report.steps.git = 'commit (push fallo)'; } }
       log('git:', report.steps.git);
     } catch (e) { log('git: fallo', e.message.slice(0, 60)); }
-  } else log(`git: ${!treeClean ? 'omitido (tree sucio)' : !validateOk ? 'omitido (validate ROJO)' : demoted.length ? '(dry)' : 'sin demote'}`);
+  } else log(`git: ${!treeClean ? 'omitido (tree sucio)' : !validateOk ? 'omitido (validate ROJO)' : huboCambio ? '(dry)' : 'sin cambios'}`);
 
   writeFileSync(join(BRAIN, 'last-maintain-report.json'), JSON.stringify(report, null, 2));
   log('DONE. report -> last-maintain-report.json');

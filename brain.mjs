@@ -226,6 +226,7 @@ function addNode() {
     process.exit(2);
   }
   name = name.replace(/[^a-zA-Z0-9_]+/g, '_').toLowerCase().replace(/^_|_$/g, '');
+  if (!name) { console.error('--name quedo vacio tras sanitizar; usa al menos un caracter alfanumerico'); process.exit(2); }
   const path = join(MEM, name + '.md');
   if (existsSync(path)) { console.error('Ya existe: ' + path); process.exit(1); }
   const d = /[:#"]/.test(desc) ? JSON.stringify(desc) : desc;
@@ -266,8 +267,48 @@ function normalize() {
   if (fixed.length && !dry) console.log('Revisa los domain="sin-clasificar" y reasigna; luego: node brain.mjs render-index');
 }
 
+// --- drain-inbox: materializa la seccion Inbox de MEMORY.md como notas reales en inbox/ ---
+// Cierra el "doble buzon" (audit#3): lo que se appendea al Inbox del N0 deja de quedarse ahi muerto;
+// pasa a inbox/ donde el consolidador SI lo lee. Deterministico, sin LLM. Limpia la seccion del N0.
+function drainInbox() {
+  const memPath = join(MEM, 'MEMORY.md');
+  if (!existsSync(memPath)) { console.log('no hay MEMORY.md'); return; }
+  const cur = readFileSync(memPath, 'utf8').replace(/\r\n/g, '\n');
+  const i = cur.indexOf(INBOX_MARKER);
+  if (i < 0) { console.log('sin seccion Inbox'); return; }
+  const body = cur.slice(i + INBOX_MARKER.length).replace(/^\n+/, '').trim();
+  if (!body || body === '<!-- vacio -->') { console.log('Inbox vacio — nada que drenar'); return; }
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 16);
+  const dst = join(MEM, 'inbox'); if (!existsSync(dst)) mkdirSync(dst, { recursive: true });
+  const note = join(dst, `_pending_${stamp}.md`);
+  if (DRY) { console.log(`[dry] drenaria ${body.length} chars del Inbox -> ${note}`); return; }
+  writeFileSync(note, `# Nota cruda drenada del Inbox de N0 (${stamp})\n\n${body}\n`);
+  // limpia la seccion Inbox del N0 (render-index la regenera vacia luego)
+  writeFileSync(memPath, cur.slice(0, i + INBOX_MARKER.length) + '\n<!-- vacio -->\n');
+  console.log(`Inbox drenado -> ${note} (${body.length} chars). Corre el consolidador o render-index.`);
+}
+
+// --- capture: productor automatico del lazo (Fase 1). Lo invoca el hook Stop con el JSON del harness en stdin.
+// Deposita UN puntero de sesion en inbox/ (idempotente por session_id). NO toca git/N0/nodos. El consolidador lo lee.
+// Los depositos van gitignored, asi NO ensucian el arbol ni bloquean los gates.
+function capture() {
+  let input = {};
+  try { input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* sin stdin valido: nota minima */ }
+  const sid = (input.session_id || input.sessionId || 'desconocida').toString().slice(0, 24).replace(/[^a-zA-Z0-9_-]/g, '');
+  const tp = input.transcript_path || input.transcriptPath || '';
+  const cwd = input.cwd || input.workingDirectory || '';
+  const inbox = join(MEM, 'inbox'); if (!existsSync(inbox)) mkdirSync(inbox, { recursive: true });
+  const note = join(inbox, `_session_${sid}.md`);
+  if (existsSync(note)) { process.exit(0); } // idempotente: una sesion, una nota
+  const stamp = new Date().toISOString().slice(0, 16);
+  writeFileSync(note, `# Sesion ${sid} (${stamp})\n\ncwd: ${cwd}\ntranscript: ${tp}\n\nPendiente: el consolidador debe leer el transcript y extraer SOLO memorias durables (decisiones, lecciones, hechos nuevos); descartar lo efimero.\n`);
+  process.exit(0);
+}
+
 if (cmd === 'render-index') renderIndex();
 else if (cmd === 'validate') validate();
 else if (cmd === 'add') addNode();
 else if (cmd === 'normalize') normalize();
-else { console.error('Uso: node brain.mjs <render-index|validate|add|normalize> [--mem <dir>] [--dry-run]'); process.exit(2); }
+else if (cmd === 'drain-inbox') drainInbox();
+else if (cmd === 'capture') capture();
+else { console.error('Uso: node brain.mjs <render-index|validate|add|normalize|drain-inbox|capture> [--mem <dir>] [--dry-run]'); process.exit(2); }

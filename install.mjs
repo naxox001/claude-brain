@@ -34,26 +34,30 @@ catch { console.error('node:sqlite no disponible en este Node'); process.exit(1)
 W(join(HOME, '.claude', 'brain.json'), JSON.stringify({ memDir: MEM.replace(/\\/g, '/'), note: 'Config del cerebro. memDir = capa markdown soberana.' }, null, 2) + '\n');
 log('config -> ~/.claude/brain.json');
 
-// 3) hook portable
-const hookSrc = join(HERE, 'templates', 'hooks', 'brain-session-start.sh');
-const hookDst = join(HOME, '.claude', 'hooks', 'brain-session-start.sh');
-if (existsSync(hookSrc)) { if (!DRY) { mkdirSync(dirname(hookDst), { recursive: true }); copyFileSync(hookSrc, hookDst); } log('hook -> ~/.claude/hooks/brain-session-start.sh'); }
-else log('WARN: template del hook ausente', hookSrc);
+// 3) hooks portables: SessionStart (health-check) + Stop (productor del lazo)
+for (const h of ['brain-session-start.sh', 'brain-session-end.sh']) {
+  const src = join(HERE, 'templates', 'hooks', h);
+  if (existsSync(src)) { if (!DRY) { mkdirSync(join(HOME, '.claude', 'hooks'), { recursive: true }); copyFileSync(src, join(HOME, '.claude', 'hooks', h)); } log('hook ->', '~/.claude/hooks/' + h); }
+  else log('WARN: template ausente', src);
+}
 
-// 4) wire settings.json (idempotente, aditivo)
+// 4) wire settings.json (idempotente, aditivo): SessionStart + Stop
 const setPath = join(HOME, '.claude', 'settings.json');
 let settings = {};
-if (existsSync(setPath)) { try { settings = JSON.parse(readFileSync(setPath, 'utf8')); } catch { log('WARN: settings.json ilegible, se respeta y no se toca'); settings = null; } }
+if (existsSync(setPath)) { try { settings = JSON.parse(readFileSync(setPath, 'utf8')); } catch { log('WARN: settings.json ilegible (JSONC?), se respeta y no se toca'); settings = null; } }
 if (settings) {
   settings.hooks = settings.hooks || {};
-  settings.hooks.SessionStart = settings.hooks.SessionStart || [];
-  const hookCmd = 'bash "$HOME/.claude/hooks/brain-session-start.sh" 2>/dev/null || true';
-  const already = JSON.stringify(settings.hooks.SessionStart).includes('brain-session-start.sh');
-  if (!already) {
-    settings.hooks.SessionStart.push({ matcher: '.*', hooks: [{ type: 'command', command: hookCmd, timeout: 15 }] });
-    W(setPath, JSON.stringify(settings, null, 2) + '\n');
-    log('settings.json: SessionStart hook agregado');
-  } else log('settings.json: hook ya presente (idempotente)');
+  let touched = false;
+  const wire = (evt, script, timeout) => {
+    settings.hooks[evt] = settings.hooks[evt] || [];
+    if (!JSON.stringify(settings.hooks[evt]).includes(script)) {
+      settings.hooks[evt].push({ matcher: '.*', hooks: [{ type: 'command', command: `bash "$HOME/.claude/hooks/${script}" 2>/dev/null || true`, timeout }] });
+      touched = true; log(`settings.json: ${evt} -> ${script} agregado`);
+    } else log(`settings.json: ${evt} ${script} ya presente (idempotente)`);
+  };
+  wire('SessionStart', 'brain-session-start.sh', 15);
+  wire('Stop', 'brain-session-end.sh', 10);
+  if (touched && !DRY) W(setPath, JSON.stringify(settings, null, 2) + '\n');
 }
 
 // 5) datos presentes?
