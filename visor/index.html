@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cerebro — mapa de memoria</title>
+<style>
+  :root { --bg:#0a0e14; --fg:#e6e6e6; --muted:#8b98a5; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
+  #graph { width:100vw; height:100vh; }
+  .panel { position:fixed; z-index:10; background:rgba(14,20,30,.82); backdrop-filter:blur(8px);
+    border:1px solid #1f2a37; border-radius:12px; padding:14px 16px; }
+  #hud { top:14px; left:14px; max-width:300px; }
+  #hud h1 { margin:0 0 4px; font-size:15px; letter-spacing:.3px; }
+  #hud .sub { color:var(--muted); font-size:12px; margin-bottom:10px; }
+  #search { width:100%; padding:7px 10px; border-radius:8px; border:1px solid #243140;
+    background:#0d1420; color:var(--fg); font-size:13px; outline:none; }
+  #legend { bottom:14px; left:14px; font-size:12px; max-height:42vh; overflow:auto; }
+  #legend .row { display:flex; align-items:center; gap:7px; margin:3px 0; cursor:pointer; opacity:.9; }
+  #legend .row:hover { opacity:1; }
+  #legend .dot { width:11px; height:11px; border-radius:50%; flex:none; }
+  #legend .n { color:var(--muted); margin-left:auto; }
+  #info { top:14px; right:14px; max-width:330px; display:none; }
+  #info h2 { margin:0 0 6px; font-size:14px; word-break:break-word; }
+  #info .meta { font-size:11px; color:var(--muted); margin-bottom:8px; }
+  #info p { font-size:12.5px; line-height:1.5; margin:0; color:#cdd6e0; }
+  #info .badge { display:inline-block; padding:1px 7px; border-radius:99px; font-size:10px; margin-right:5px; }
+  .err { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#ff6b6b; font-size:14px; padding:40px; text-align:center; }
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="hud" class="panel">
+  <h1>🧠 Cerebro — mapa de memoria</h1>
+  <div class="sub" id="stats">cargando…</div>
+  <input id="search" placeholder="buscar nodo…" autocomplete="off" />
+</div>
+<div id="legend" class="panel"></div>
+<div id="info" class="panel">
+  <h2 id="i-name"></h2>
+  <div class="meta" id="i-meta"></div>
+  <p id="i-desc"></p>
+</div>
+
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/3d-force-graph@1.73.4/dist/3d-force-graph.min.js"></script>
+<script>
+// paleta generica asignada por dominio (sirve a CUALQUIER conjunto de dominios, no hardcodea ninguno)
+const PALETTE = ['#ffd166','#06d6a0','#4cc9f0','#80ed99','#f72585','#b5179e','#ff924c','#7b2ff7','#00bbf9','#48cae4','#ffb4a2','#c77dff','#90be6d','#f9c74f','#43aa8b','#577590'];
+let colorFor = () => '#888';  // se reasigna al cargar data (segun dominios presentes)
+const REL_COLORS = { member:'rgba(120,130,150,.18)', wikilink:'rgba(120,180,255,.38)', supersedes:'#ff4d6d', relates:'rgba(180,255,180,.4)' };
+const STATUS_OPACITY = { vigente:1, pausado:.6, cerrado:.32, archivado:.32 };
+
+function fail(msg){ document.body.insertAdjacentHTML('beforeend','<div class="err">'+msg+'</div>'); }
+
+fetch('./graph.json').then(r=>{ if(!r.ok) throw new Error('graph.json '+r.status); return r.json(); }).then(data=>{
+  if(!window.ForceGraph3D){ fail('No se pudo cargar 3d-force-graph (sin conexión a CDN). El grafo igual existe en graph.json y graph.db.'); return; }
+  const byId = Object.fromEntries(data.nodes.map(n=>[n.id,n]));
+  const domains = {};
+  data.nodes.forEach(n=>domains[n.domain]=(domains[n.domain]||0)+1);
+  // asignar colores por dominio (orden estable) — generico para cualquier instalacion
+  const domainList = Object.keys(domains).sort();
+  colorFor = d => PALETTE[(domainList.indexOf(d) + PALETTE.length) % PALETTE.length] || '#888';
+
+  document.getElementById('stats').textContent =
+    data.nodes.length+' nodos · '+data.links.length+' sinapsis · '+Object.keys(domains).length+' dominios';
+
+  // leyenda
+  const leg = document.getElementById('legend');
+  leg.innerHTML = '<div style="color:var(--muted);margin-bottom:6px">dominios (lóbulos)</div>' +
+    Object.entries(domains).sort((a,b)=>b[1]-a[1]).map(([d,n])=>
+      `<div class="row" data-d="${d}"><span class="dot" style="background:${colorFor(d)}"></span>${d}<span class="n">${n}</span></div>`).join('');
+
+  const Graph = ForceGraph3D()(document.getElementById('graph'))
+    .backgroundColor('#0a0e14')
+    .graphData(data)
+    .nodeId('id')
+    .nodeVal('val')
+    .nodeColor(n => colorFor(n.domain))
+    .nodeOpacity(0.92)
+    .nodeLabel(n => `<div style="font:13px sans-serif;color:#fff;background:#111a;padding:4px 8px;border-radius:6px">
+        <b>${n.name}</b><br><span style="color:#9fb">${n.domain}</span> · ${n.status}${n.isDigest?' · <i>digest</i>':''}</div>`)
+    .linkColor(l => REL_COLORS[l.rel] || 'rgba(255,255,255,.2)')
+    .linkOpacity(0.5)
+    .linkWidth(l => l.rel==='supersedes'?1.5:0.4)
+    .linkDirectionalParticles(l => l.rel==='wikilink'?0:0)
+    .onNodeClick(n => {
+      Graph.cameraPosition({ x:n.x*1.6, y:n.y*1.6, z:n.z*1.6 }, n, 800);
+      const info=document.getElementById('info'); info.style.display='block';
+      document.getElementById('i-name').textContent=n.name;
+      document.getElementById('i-meta').innerHTML=
+        `<span class="badge" style="background:${colorFor(n.domain)};color:#000">${n.domain}</span>`+
+        `<span class="badge" style="background:#243140">${n.status}</span>`+
+        `<span class="badge" style="background:#243140">${n.type}</span>`;
+      document.getElementById('i-desc').textContent=n.id;
+    });
+
+  // resaltar al hacer click en dominio
+  leg.querySelectorAll('.row').forEach(row=>row.onclick=()=>{
+    const d=row.dataset.d;
+    Graph.nodeColor(n => n.domain===d ? (colorFor(d)) : '#2a323d');
+  });
+
+  // busqueda
+  document.getElementById('search').addEventListener('input', e=>{
+    const q=e.target.value.toLowerCase().trim();
+    Graph.nodeColor(n => !q ? (colorFor(n.domain))
+      : ((n.id.toLowerCase().includes(q)||n.name.toLowerCase().includes(q)) ? '#fff' : '#2a323d'));
+  });
+
+  window.__graphReady = true; // marcador para verificacion automatizada
+}).catch(e=>fail('Error cargando el grafo: '+e.message));
+</script>
+</body>
+</html>

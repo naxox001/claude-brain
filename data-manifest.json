@@ -1,0 +1,34 @@
+{
+  "system": "claude-brain",
+  "version": "1.0",
+  "description": "Manifiesto de migracion: que mover a una maquina nueva. El CODIGO viaja por git (este repo). Los DATOS por las 2 entradas de abajo.",
+  "code": {
+    "repo": "este repositorio (claude-brain): brain.mjs, graph.mjs, maintain.mjs, consolidate.mjs, brain.config.mjs, visor/, templates/, install.mjs, restore.mjs"
+  },
+  "dataStores": [
+    {
+      "id": "memory",
+      "what": "Capa markdown soberana (fuente de verdad: nodos + digests + archivo)",
+      "target": "$HOME/.claude/projects/<slug>/memory",
+      "via": "git clone <repo privado de memoria>  (recomendado) — o restore.mjs desde backup",
+      "note": "El slug lo resuelve brain.config.mjs; el installer escribe ~/.claude/brain.json con el memDir exacto."
+    },
+    {
+      "id": "episodic",
+      "what": "Memoria episodica conversacional (plugin episodic-memory)",
+      "target": "$HOME/.config/superpowers/",
+      "via": "copia directa (1.5GB aprox) desde backup frio o cp -r de la maquina origen",
+      "note": "Unica capa semantica viva. No esta en git por tamano; se respalda con restore.mjs / backup frio."
+    }
+  ],
+  "derived": {
+    "regenerables": ["MEMORY.md (N0)", "derived/graph.db", "visor/graph.json", "archivo/CATALOGO.md", "SYSTEM-STATE.md"],
+    "how": "node brain.mjs render-index && node graph.mjs build && node graph.mjs export-3d  (lo corre install.mjs)"
+  },
+  "config": { "file": "$HOME/.claude/brain.json", "writtenBy": "install.mjs" },
+  "automation": {
+    "hook": "SessionStart -> brain-session-start.sh (instalado por install.mjs, wired en settings.json)",
+    "scheduledTasks": ["ClaudeBrain-Maintain (semanal)", "ClaudeBrain-Consolidate (diario)"]
+  },
+  "dependencies": { "node": ">=22 (node:sqlite + fs.cpSync)", "git": "cualquiera", "claude": "solo para el consolidador nocturno (opcional)" }
+}
