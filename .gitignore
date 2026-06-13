@@ -17,3 +17,4 @@ MAINTAIN-ALERT.txt
 CONSOLIDATOR-ALERT.txt
 .brain*.lock
 SYSTEM-STATE.md
+rollback-backups/

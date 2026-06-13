@@ -16,8 +16,11 @@ const DRY = args.includes('--dry-run');
 const SKIP_TASKS = args.includes('--skip-tasks');
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME = flag('--home') || process.env.USERPROFILE || process.env.HOME;
+if (typeof HOME !== 'string' || !HOME) { console.error('--home requiere una ruta'); process.exit(2); }  // audit#6 #8
 const slug = HOME.replace(/[^a-zA-Z0-9]/g, '-');  // igual que brain.config.slugFromHome (cada no-alfanumerico -> '-')
-const MEM = flag('--mem') || join(HOME, '.claude', 'projects', slug, 'memory');
+const memFlag = flag('--mem');
+if (memFlag === true) { console.error('--mem requiere una ruta'); process.exit(2); }  // audit#6 #8
+const MEM = memFlag || join(HOME, '.claude', 'projects', slug, 'memory');
 const log = (...a) => console.log(DRY ? '[dry]' : '[ok]', ...a);
 const node = process.execPath;
 const W = (p, c) => { if (DRY) { log('escribiria', p); return; } mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, c); };

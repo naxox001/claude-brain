@@ -12,6 +12,8 @@ import { parseFrontmatter, writeAtomic } from './lib.mjs';
 const args = process.argv.slice(2);
 const cmd = args[0];
 const memIdx = args.indexOf('--mem');
+// guard anti foot-gun (audit#6 #7): '--mem' sin valor caia SILENCIOSAMENTE a la memoria REAL. Abortar.
+if (memIdx >= 0 && (args[memIdx + 1] === undefined || args[memIdx + 1].startsWith('--'))) { console.error('--mem requiere una ruta'); process.exit(2); }
 const MEM = resolveMem(memIdx >= 0 ? args[memIdx + 1] : null);
 const DRY = args.includes('--dry-run');
 const N0_CAP = 7168;          // tope duro del indice generado (bytes)
@@ -52,7 +54,9 @@ function renderIndex() {
   // PISO DE SEGURIDAD: si NO hay nodos v3 VALIDOS pero el dir tiene .md, algo fallo (parser/ruta). No sobreescribir el N0.
   // Cuenta v3-validos (no solo parseables): un dir lleno de nodos rotos-pero-parseables NO debe vaciar el N0 (audit#5 #27).
   const valid = nodes.filter(n => !discarded.includes(n));
-  const mdOnDisk = existsSync(MEM) && readdirSync(MEM).some(f => f.endsWith('.md') && f !== 'MEMORY.md');
+  // hay markdown en disco si scanLayer hallo algun .md en raiz/digests/archivo (audit#6 #3: antes solo miraba
+  // la raiz, dejando el piso ciego a una memoria con nodos SOLO en digests/ o archivo/).
+  const mdOnDisk = nodes.length > 0;
   if (valid.length === 0 && mdOnDisk) {
     console.error('[ABORT] render-index: 0 nodos validos parseados pero hay .md en disco. No se sobreescribe MEMORY.md (posible parser/ruta rota).');
     process.exit(1);
@@ -61,7 +65,8 @@ function renderIndex() {
   // debe presentarse como "siempre vigente" en cada sesion; para retirar una regla basta cambiar su status).
   const reglas = nodes.filter(n => n.fm && Number(n.fm.metadata.importance) >= 5 && !n.fm.metadata.digest && n.fm.metadata.status === 'vigente')
     .sort((a, b) => a.stem.localeCompare(b.stem));
-  const digests = nodes.filter(n => n.fm && n.fm.metadata.digest)
+  // digests v3-VALIDOS (excluye los descartados): un digest sin domain/status no debe rendir una linea '**undefined**' (audit#6 #11/#21)
+  const digests = nodes.filter(n => !discarded.includes(n) && n.fm.metadata.digest)
     .sort((a, b) => String(a.fm.metadata.domain).localeCompare(String(b.fm.metadata.domain)));
   const porDominio = {};
   for (const n of nodes.filter(n => n.fm && !n.fm.metadata.digest)) {
@@ -150,6 +155,9 @@ function validate() {
     // Esto hace real la deteccion de "contradicciones" que el README promete y la deja como gate del lazo.
     if (n.fm.metadata.superseded_by && n.fm.metadata.status === 'vigente') {
       errors.push(`${n.file}: contradiccion — status vigente pero superseded_by="${n.fm.metadata.superseded_by}" (deberia estar cerrado/pausado)`);
+    }
+    if (n.fm.metadata.superseded_by && String(n.fm.metadata.superseded_by) === n.stem) {
+      errors.push(`${n.file}: superseded_by se apunta a si mismo (audit#6 #34)`);
     }
     for (const m of n.body.matchAll(/\[\[([^\]\n]+)\]\]/g)) {
       const t = m[1].trim();
@@ -248,10 +256,11 @@ function drainInbox() {
   const body = cur.slice(i + INBOX_MARKER.length).replace(/^\n+/, '').trim();
   if (!body || body === '<!-- vacio -->') { console.log('Inbox vacio — nada que drenar'); return; }
   const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);  // granularidad de SEGUNDOS (audit#5 #37)
-  const dst = join(MEM, 'inbox'); if (!existsSync(dst)) mkdirSync(dst, { recursive: true });
+  const dst = join(MEM, 'inbox');
   let note = join(dst, `_pending_${stamp}.md`);
   for (let k = 2; existsSync(note); k++) note = join(dst, `_pending_${stamp}_${k}.md`);  // no sobreescribir una nota previa
-  if (DRY) { console.log(`[dry] drenaria ${body.length} chars del Inbox -> ${note}`); return; }
+  if (DRY) { console.log(`[dry] drenaria ${body.length} chars del Inbox -> ${note}`); return; }  // dry NO crea inbox/ (audit#6 #25)
+  if (!existsSync(dst)) mkdirSync(dst, { recursive: true });
   writeAtomic(note, `# Nota cruda drenada del Inbox de N0 (${stamp})\n\n${body}\n`);
   // limpia la seccion Inbox del N0 (render-index la regenera vacia luego)
   writeAtomic(memPath, cur.slice(0, i + INBOX_MARKER.length) + '\n<!-- vacio -->\n');

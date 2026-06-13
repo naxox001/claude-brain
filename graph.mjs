@@ -17,6 +17,7 @@ const args = process.argv.slice(2);
 const cmd = args[0];
 const memIdx = args.indexOf('--mem');
 const outIdx = args.indexOf('--out');
+if (memIdx >= 0 && (args[memIdx + 1] === undefined || args[memIdx + 1].startsWith('--'))) { console.error('--mem requiere una ruta'); process.exit(2); }  // audit#6 #7
 const MEM = resolveMem(memIdx >= 0 ? args[memIdx + 1] : null);
 const BRAIN = BRAIN_DIR;
 const OUT = outIdx >= 0 ? args[outIdx + 1] : BRAIN;

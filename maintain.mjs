@@ -13,6 +13,7 @@ import { parseFrontmatter } from './lib.mjs';
 const args = process.argv.slice(2);
 const DRY = args.includes('--dry-run');
 const memIdx = args.indexOf('--mem');
+if (memIdx >= 0 && (args[memIdx + 1] === undefined || args[memIdx + 1].startsWith('--'))) { console.error('--mem requiere una ruta'); process.exit(2); }  // audit#6 #7
 const HOME = CFG_HOME;
 const MEM = resolveMem(memIdx >= 0 ? args[memIdx + 1] : null);
 const BRAIN = BRAIN_DIR;
@@ -310,7 +311,7 @@ function run() {
     } catch (e) { log('git: fallo', e.message.slice(0, 60)); }
   } else log(`git: ${!treeClean ? 'omitido (tree sucio)' : !validateOk ? 'omitido (validate ROJO)' : huboCambio ? '(dry)' : 'sin cambios'}`);
 
-  writeFileSync(join(BRAIN, 'last-maintain-report.json'), JSON.stringify(report, null, 2));
+  if (!DRY) writeFileSync(join(BRAIN, 'last-maintain-report.json'), JSON.stringify(report, null, 2));  // dry no escribe (audit#6 #20)
   log('DONE. report -> last-maintain-report.json');
   return report;
 }

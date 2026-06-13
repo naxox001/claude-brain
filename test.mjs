@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, cpSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, cpSync, existsSync, readdirSync, utimesSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,11 @@ const NODE = process.execPath;
 // exec que devuelve {code, out}; nunca lanza
 function run(cmdArgs) {
   try { const out = execFileSync(NODE, cmdArgs, { cwd: HERE, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return { code: 0, out }; }
+  catch (e) { return { code: e.status ?? 1, out: (e.stdout || '') + (e.stderr || '') }; }
+}
+// como run() pero con env propio (para subprocesos que deben ver HOME/BRAIN_BACKUP de prueba)
+function run2(cmdArgs, env) {
+  try { const out = execFileSync(NODE, cmdArgs, { cwd: HERE, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env }); return { code: 0, out }; }
   catch (e) { return { code: e.status ?? 1, out: (e.stdout || '') + (e.stderr || '') }; }
 }
 function tmpMem() {
@@ -204,8 +209,9 @@ test('acquireLock reclama lock STALE (viejo por edad / pid muerto / ilegible) (#
     let g = acquireLock(name, 1000); assert.ok(g, 'lock viejo por edad debe reclamarse'); releaseLock(g);
     writeFileSync(lp, JSON.stringify({ pid: 2147483646, ts: Date.now() }));  // pid casi seguro muerto
     g = acquireLock(name, 3_600_000); assert.ok(g, 'lock de pid muerto debe reclamarse'); releaseLock(g);
-    writeFileSync(lp, 'esto no es json');
-    g = acquireLock(name, 3_600_000); assert.ok(g, 'lock ilegible debe reclamarse'); releaseLock(g);
+    // ilegible: se reclama solo si NO es recien creado (un ilegible fresco = otro proceso escribiendolo, audit#6 #14)
+    writeFileSync(lp, 'esto no es json'); const oldT = (Date.now() - 60_000) / 1000; utimesSync(lp, oldT, oldT);
+    g = acquireLock(name, 3_600_000); assert.ok(g, 'lock ilegible VIEJO debe reclamarse'); releaseLock(g);
   } finally { try { rmSync(lp, { force: true }); } catch {} }
 });
 
@@ -275,6 +281,7 @@ test('grafo: query con graph.db corrupta se auto-reconstruye en vez de crashear 
   writeFileSync(db, 'esto no es una base sqlite');  // corromper
   const r = run(['graph.mjs', 'query', 'digest', '--mem', mem, '--out', out]);
   assert.equal(r.code, 0, 'query debe auto-reconstruir y salir 0: ' + r.out);
+  assert.match(r.out, /MATCH \([1-9]/, 'la reconstruccion debe producir resultados reales, no una db vacia: ' + r.out.slice(0, 200));
   rmSync(d, { recursive: true, force: true });
 });
 
@@ -284,12 +291,14 @@ test('consolidate: diffViolations permite digests/nodos-v3 y marca borrado/no-v3
   const bigDigest = name => `---\nname: digest-${name}\ndescription: d\nmetadata:\n  type: reference\n  domain: ${name}\n  status: vigente\n  valid_from: 2026-01-01\n  digest: true\n---\n# D\n## Vigente ahora\nL1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n`;
   writeFileSync(join(mem, 'digests', 'web.md'), bigDigest('web'));
   writeFileSync(join(mem, 'digests', 'otro.md'), bigDigest('otro'));
+  writeFileSync(join(mem, 'digests', 'reseñas.md'), bigDigest('resenas')); // nombre NO-ASCII (#6 core.quotepath)
   writeFileSync(join(mem, 'project_base.md'), v3('project_base', 'web', 'vigente', 3, 'base'));
   const g = (...a) => execFileSync('git', ['-C', mem, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   g('init', '-q'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't'); g('add', '-A'); g('commit', '-q', '-m', 'init');
   const head = g('rev-parse', 'HEAD').trim();
   // simular cambios del LLM:
   writeFileSync(join(mem, 'digests', 'web.md'), readFileSync(join(mem, 'digests', 'web.md'), 'utf8') + 'L9\nL10\n'); // edita (OK)
+  writeFileSync(join(mem, 'digests', 'reseñas.md'), readFileSync(join(mem, 'digests', 'reseñas.md'), 'utf8') + 'L9\nL10\n'); // edita digest no-ASCII (OK, #6)
   writeFileSync(join(mem, 'digests', 'otro.md'), '---\nname: digest-otro\ndescription: d\nmetadata:\n  domain: otro\n  digest: true\n---\n# vacio\n'); // VACIA (viol magnitud)
   rmSync(join(mem, 'project_base.md')); // borra tracked (viol)
   writeFileSync(join(mem, 'basura.md'), 'no soy un nodo v3\n'); // raiz no-v3 (viol)
@@ -302,6 +311,7 @@ test('consolidate: diffViolations permite digests/nodos-v3 y marca borrado/no-v3
   assert.match(j, /vacio\/recorto.*otro/, 'vaciar un digest es violacion (#14): ' + j);
   assert.match(j, /no-permitido basura/, 'archivo raiz no-v3 es violacion: ' + j);
   assert.ok(!/web\.md/.test(j), 'editar un digest normalmente NO es violacion: ' + j);
+  assert.ok(!/rese/.test(j), 'editar un digest con nombre no-ASCII NO debe ser violacion espuria (#6 core.quotepath): ' + j);
   assert.ok(!/project_nuevo/.test(j), 'un nodo v3 nuevo NO es violacion: ' + j);
   // reEnqueueInbox + limpieza de .procesadas (#29)
   mkdirSync(join(mem, 'inbox', '.procesadas'), { recursive: true });
@@ -359,5 +369,102 @@ test('capture: BRAIN_CONSOLIDATING=1 es NO-OP (sin nota); sin la env si crea not
   assert.equal(readdirInbox(mem).length, 0, 'con BRAIN_CONSOLIDATING no debe crear nota (NO-OP)');
   execFileSync(NODE, ['brain.mjs', 'capture', '--mem', mem], { cwd: HERE, input: inp, encoding: 'utf8' });
   assert.ok(existsSync(join(mem, 'inbox', '_session_sGuard.md')), 'sin la env debe crear la nota de sesion');
+  rmSync(d, { recursive: true, force: true });
+});
+
+// === REGRESION audit#6 ===
+
+test('consolidate: el spawn de claude -p conserva los flags de seguridad (anti SANDBOX_BREACH) (#1)', () => {
+  const src = readFileSync(join(HERE, 'consolidate.mjs'), 'utf8');
+  assert.match(src, /--permission-mode/, 'debe acotar el permission-mode');
+  assert.match(src, /--allowedTools/, 'debe pasar allowedTools');
+  assert.match(src, /--disallowedTools/, 'debe pasar disallowedTools (denylist vinculante)');
+  assert.match(src, /Bash,WebFetch,WebSearch/, 'debe denegar Bash/red');
+  assert.match(src, /stdio:\s*'ignore'/, "el stdout del LLM no debe heredarse al log");
+});
+
+test('acquireLock: lock vacio FRESCO no se reclama (ventana de doble-adquisicion); vacio VIEJO si (#14)', () => {
+  const name = '.brain-test-empty.lock';
+  const lp = join(BRAIN_DIR, name);
+  try {
+    writeFileSync(lp, '');  // vacio, mtime = ahora (simula otro proceso a mitad de openSync->writeFileSync)
+    assert.equal(acquireLock(name, 3_600_000), null, 'un lock vacio recien creado NO debe reclamarse');
+    const old = (Date.now() - 60_000) / 1000; utimesSync(lp, old, old);  // envejecer
+    const g = acquireLock(name, 3_600_000); assert.ok(g, 'un lock vacio VIEJO si debe reclamarse'); releaseLock(g);
+  } finally { try { rmSync(lp, { force: true }); } catch {} }
+});
+
+test('releaseLock no borra un lock de OTRO pid (ownership) (#5)', () => {
+  const name = '.brain-test-own.lock';
+  const lp = join(BRAIN_DIR, name);
+  try {
+    writeFileSync(lp, JSON.stringify({ pid: 2147483646, ts: Date.now() }));  // lock ajeno
+    releaseLock(lp);
+    assert.ok(existsSync(lp), 'releaseLock no debe borrar un lock que no es nuestro');
+  } finally { try { rmSync(lp, { force: true }); } catch {} }
+});
+
+test('render-index PISO cubre digests/ y archivo/, no solo la raiz (#3)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-floor2-'));
+  const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
+  writeFileSync(join(mem, 'MEMORY.md'), 'CONTENIDO PREVIO IMPORTANTE\n');
+  // .md SOLO en digests/, parseable pero NO v3-valido (sin domain/status): valid=0
+  writeFileSync(join(mem, 'digests', 'roto.md'), '---\nname: digest-roto\ndescription: x\nmetadata:\n  type: reference\n---\nx\n');
+  const r = run(['brain.mjs', 'render-index', '--mem', mem]);
+  assert.equal(r.code, 1, 'debe abortar aunque el .md viva en digests/: ' + r.out);
+  assert.match(readFileSync(join(mem, 'MEMORY.md'), 'utf8'), /CONTENIDO PREVIO/, 'no debe sobreescribir el N0');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('render-index: un digest sin domain NO rinde una linea "**undefined**" (#11)', () => {
+  const { d, mem } = tmpMem();
+  writeFileSync(join(mem, 'digests', 'sindom.md'), '---\nname: digest-sindom\ndescription: x\nmetadata:\n  status: vigente\n  digest: true\n---\nx\n');
+  const r = run(['brain.mjs', 'render-index', '--mem', mem, '--dry-run']);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!/\*\*undefined\*\*/.test(r.out), 'no debe haber una linea de dominio "**undefined**": ' + r.out.slice(0, 300));
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('validate detecta superseded_by que se apunta a si mismo (#34)', () => {
+  const { d, mem } = tmpMem();
+  writeFileSync(join(mem, 'project_loop.md'), v3('project_loop', 'web', 'cerrado', 2, 'd', 'superseded_by: project_loop'));
+  const r = run(['brain.mjs', 'validate', '--mem', mem]);
+  assert.equal(r.code, 1);
+  assert.match(r.out, /superseded_by se apunta a si mismo/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('--mem sin valor aborta (no cae silenciosamente a la memoria real) (#7)', () => {
+  const r = run(['brain.mjs', 'validate', '--mem']);
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /--mem requiere una ruta/);
+});
+
+test('install.mjs --dry-run corre limpio y --home sin valor aborta (cobertura basica + #8)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-install-'));
+  const r = run(['install.mjs', '--home', d, '--mem', join(d, 'mem'), '--skip-tasks', '--dry-run']);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /MEM=/);
+  const r2 = run(['install.mjs', '--home']);  // sin valor -> TypeError-foot-gun, ahora abortado
+  assert.notEqual(r2.code, 0, '--home sin valor debe fallar limpio');
+  assert.match(r2.out, /--home requiere una ruta/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('maintain: demote mueve cerrados >60d a archivo/ y deja los recientes (#2/G2)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-maint-'));
+  const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
+  writeFileSync(join(mem, 'digests', 'web.md'), '---\nname: digest-web\ndescription: d\nmetadata: { type: reference, domain: web, status: vigente, valid_from: 2026-01-01, digest: true }\n---\n# D\n## Vigente ahora\nok\n');
+  const closed = (name, vf) => `---\nname: ${name}\ndescription: d\nmetadata:\n  type: project\n  domain: web\n  status: cerrado\n  valid_from: ${vf}\n  importance: 2\n---\ncuerpo\n`;
+  const hoy = new Date().toISOString().slice(0, 10);
+  writeFileSync(join(mem, 'viejo_cerrado.md'), closed('viejo_cerrado', '2020-01-01'));
+  writeFileSync(join(mem, 'nuevo_cerrado.md'), closed('nuevo_cerrado', hoy));
+  const g = (...a) => execFileSync('git', ['-C', mem, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g('init', '-q'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't'); g('add', '-A'); g('commit', '-q', '-m', 'i');
+  // HOME/USERPROFILE -> temp para que NO toque la episodica real (~1.5GB) ni el brain.json real; backup -> temp.
+  const env = { ...process.env, USERPROFILE: d, HOME: d, BRAIN_BACKUP: join(d, 'backup') };
+  const r = run2(['maintain.mjs', '--mem', mem], env);
+  assert.ok(existsSync(join(mem, 'archivo', 'viejo_cerrado.md')), 'el cerrado VIEJO (>60d) debe moverse a archivo/: ' + r.out.slice(-300));
+  assert.ok(existsSync(join(mem, 'nuevo_cerrado.md')) && !existsSync(join(mem, 'archivo', 'nuevo_cerrado.md')), 'el cerrado RECIENTE debe quedarse');
   rmSync(d, { recursive: true, force: true });
 });

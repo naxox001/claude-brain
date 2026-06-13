@@ -30,5 +30,5 @@
     "hook": "SessionStart -> brain-session-start.sh (instalado por install.mjs, wired en settings.json)",
     "scheduledTasks": ["ClaudeBrain-Maintain (semanal)", "ClaudeBrain-Consolidate (diario)"]
   },
-  "dependencies": { "node": ">=22 (node:sqlite + fs.cpSync)", "git": "cualquiera", "claude": "solo para el consolidador nocturno (opcional)" }
+  "dependencies": { "node": ">=22.5 (node:sqlite + fs.cpSync)", "git": "cualquiera", "claude": "solo para el consolidador nocturno (opcional)" }
 }

@@ -11,7 +11,7 @@
 //    las notas de inbox movidas. Preserva el WIP de otra sesion (NO usa reset --hard global). Alerta siempre.
 //  - Cada corrida exitosa = 1 commit git (auditable y revertible con git revert).
 // Uso: node consolidate.mjs [--dry-run]
-import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, cpSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, acquireLock, releaseLock } from './brain.config.mjs';
@@ -241,6 +241,20 @@ function rollback(head, untrackedBefore, inboxBefore) {
     for (const ps of ['digests', 'MEMORY.md', 'archivo/CATALOGO.md']) {
       try { sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'checkout', '--', ps]); } catch { /* path ausente o sin cambios: ignorar */ }
     }
+    // nodos RAIZ tracked que cambiaron durante el run (D/M/R). El tree estaba LIMPIO al inicio (gate de main), asi
+    // que estos cambios son del run -> casi siempre el LLM violando su contrato. Los revertimos para ROMPER EL WEDGE
+    // (audit#6 #4), pero RESPALDAMOS su contenido actual FUERA de MEM (en BRAIN/rollback-backups) por si una sesion
+    // humana edito uno en la ventana: el original esta en HEAD y lo revertido queda recuperable. Cero perdida real.
+    try {
+      const rootChanged = sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'diff', '--name-only', 'HEAD'])
+        .split('\n').map(s => s.trim()).filter(p => p && p.endsWith('.md') && !p.includes('/') && p !== 'MEMORY.md');
+      if (rootChanged.length) {
+        const bdir = join(BRAIN, 'rollback-backups', new Date().toISOString().replace(/[:.]/g, '-'));
+        for (const p of rootChanged) { try { const f = join(MEM, p); if (existsSync(f)) { mkdirSync(bdir, { recursive: true }); cpSync(f, join(bdir, p)); } } catch {} }
+        for (const p of rootChanged) { try { sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'checkout', '--', p]); } catch {} }
+        log(`rollback: ${rootChanged.length} nodo(s) raiz tracked del run revertidos (respaldo en ${bdir})`);
+      }
+    } catch {}
     const before = new Set(untrackedBefore || []);
     const newOnes = listUntracked().filter(p => !before.has(p));
     for (const p of newOnes) {

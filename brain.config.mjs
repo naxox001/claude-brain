@@ -1,7 +1,7 @@
 // brain.config.mjs — resolucion portable de rutas (sin hardcodear el slug de la maquina).
 // Prioridad: --mem CLI > $BRAIN_MEM > ~/.claude/brain.json {memDir} > auto-detect del slug del HOME.
 // El installer escribe ~/.claude/brain.json en cada maquina; asi el codigo publicado no tiene rutas personales.
-import { existsSync, readFileSync, writeFileSync, openSync, closeSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, openSync, closeSync, rmSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,27 +53,50 @@ function pidAlive(pid) {
 //     otro proceso ya lo reclamo -> no se toca su lock fresco (cierra el TOCTOU del rmSync ciego anterior).
 export function acquireLock(name = '.brain.lock', maxAgeMs = 3600000) {
   const lockPath = join(BRAIN_DIR, name);
+  const FRESH_MS = 5000;  // un lock vacio/ilegible MAS NUEVO que esto = otro proceso escribiendo su contenido (NO stale)
   for (let attempt = 0; attempt < 3; attempt++) {
+    let fd;
     try {
-      const fd = openSync(lockPath, 'wx');  // atomico: solo un proceso lo crea
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() })); closeSync(fd);
+      fd = openSync(lockPath, 'wx');  // atomico: solo un proceso lo crea
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+      closeSync(fd); fd = undefined;
       return lockPath;
     } catch (e) {
-      if (e.code !== 'EEXIST') return null;  // no pude crearlo por otra razon (permisos, etc.)
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }  // no filtrar el fd si el write lanzo (audit#6 #14)
+      if (e.code !== 'EEXIST') {
+        // openSync creo pero el write fallo (ENOSPC/EIO): no dejar un lock VACIO nuestro colgado
+        try { if (existsSync(lockPath) && !readFileSync(lockPath, 'utf8').trim()) rmSync(lockPath); } catch {}
+        return null;
+      }
     }
-    // existe: decidir si es stale
-    let info = null;
-    try { info = JSON.parse(readFileSync(lockPath, 'utf8')); } catch { /* ilegible -> stale */ }
-    const stale = !info || (Date.now() - info.ts >= maxAgeMs) || !pidAlive(info.pid);
-    if (!stale) return null;  // lock vivo de otro proceso: no tocar
+    // ya existe: decidir si es stale
+    let info = null, ageMs = Infinity;
+    try {
+      const raw = readFileSync(lockPath, 'utf8');
+      try { ageMs = Date.now() - statSync(lockPath).mtimeMs; } catch {}
+      info = raw.trim() ? JSON.parse(raw) : null;
+    } catch { /* ilegible */ }
+    // VENTANA DE DOBLE-ADQUISICION (audit#6): entre el openSync('wx') y el writeFileSync de OTRO proceso el lock
+    // queda VACIO. Tratarlo como stale al instante permitia que dos procesos lo reclamaran. Ahora un lock
+    // vacio/ilegible solo es stale si NO es recien creado (age >= FRESH_MS); si es fresco, asumimos que otro lo escribe.
+    const stale = info
+      ? (Date.now() - info.ts >= maxAgeMs || !pidAlive(info.pid))
+      : (ageMs >= FRESH_MS);
+    if (!stale) return null;  // lock vivo (o recien naciendo) de otro proceso: no tocar
     // re-confirmar que sigue siendo el MISMO lock stale antes de borrar (cierra TOCTOU practico)
     try {
       const again = JSON.parse(readFileSync(lockPath, 'utf8'));
       if (info && (again.ts !== info.ts || again.pid !== info.pid)) return null;  // otro lo reclamo recien
-    } catch { /* desaparecio o ilegible: el retry de openSync resolvera */ }
+    } catch { /* desaparecio/ilegible: el retry de openSync resolvera */ }
     try { rmSync(lockPath); } catch { /* otro lo borro: el retry de openSync resolvera */ }
     // vuelve al tope del loop: openSync('wx') decide atomicamente quien gana
   }
   return null;
 }
-export function releaseLock(lockPath) { if (lockPath) { try { rmSync(lockPath); } catch {} } }
+// releaseLock: borra el lock SOLO si es NUESTRO (mismo pid). Evita que un release tardio borre el lock que
+// otro proceso reclamo tras un stale (audit#6 #5). Si es ilegible, asumimos nuestro (a medio escribir) y lo limpiamos.
+export function releaseLock(lockPath) {
+  if (!lockPath) return;
+  try { const { pid } = JSON.parse(readFileSync(lockPath, 'utf8')); if (pid !== process.pid) return; } catch {}
+  try { rmSync(lockPath); } catch {}
+}
