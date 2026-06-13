@@ -4,8 +4,8 @@
 // Pasos: validate -> secret-scan -> auto-demote cerrados>60d a archivo/ -> render-index (N0) ->
 //        graph build + export-3d -> backup a G: -> SYSTEM-STATE.md -> git commit/push si hubo cambios.
 // Uso: node maintain.mjs [--dry-run] [--mem <dir>]
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, renameSync, mkdirSync, cpSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, renameSync, mkdirSync, cpSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, resolveBackupDir, acquireLock, releaseLock } from './brain.config.mjs';
 
@@ -93,6 +93,59 @@ function daysSince(iso) {
 
 function alert(msg) { if (!DRY) { try { writeFileSync(join(BRAIN, 'MAINTAIN-ALERT.txt'), `${new Date().toISOString()} ${msg}\n`); } catch {} } log('ALERTA:', msg); }
 
+// ---- DR de la episodica (audit#4) ----
+// La episodica (~1.5GB en ~/.config/superpowers) NO entraba al backup de maintain; su unica copia era un
+// tarball frio MANUAL viejo. Aqui generamos/rotamos un tarball comprimido compatible con restore.mjs.
+// CADENCIA: maintain corre SEMANAL, pero la episodica es pesada -> solo regeneramos si el ultimo tarball
+//           supera EPISODIC_REFRESH_DAYS (no en cada corrida). STALENESS: alertamos si supera EPISODIC_STALE_DAYS
+//           o si no existe ninguno. ROTACION: conservamos los EPISODIC_KEEP mas recientes.
+const EPISODIC_REFRESH_DAYS = 7;   // regenerar a lo mas 1 vez por semana
+const EPISODIC_STALE_DAYS = 14;    // 2 corridas semanales perdidas -> alerta
+const EPISODIC_KEEP = 4;           // ~1 mes de tarballs
+// Compatible con restore.mjs: nombre matchea /episodic-superpowers/, contenido tiene 'superpowers/' al tope.
+function backupEpisodic(destDir, ts) {
+  const cfgDir = join(HOME, '.config');
+  const src = join(cfgDir, 'superpowers');
+  if (!existsSync(src)) { log('episodic backup: no existe ~/.config/superpowers (nada que respaldar)'); return; }
+  // tarballs existentes (mas reciente primero por mtime)
+  let existing = [];
+  try { existing = readdirSync(destDir).filter(f => /episodic-superpowers.*\.tar\.gz$/.test(f))
+      .map(f => ({ f, m: statSync(join(destDir, f)).mtimeMs })).sort((a, b) => b.m - a.m); } catch {}
+  const ageDays = existing.length ? (Date.now() - existing[0].m) / 86400000 : Infinity;
+  // STALENESS: alerta si el ultimo backup es viejo (o no existe). Independiente de si hoy regeneramos.
+  if (ageDays > EPISODIC_STALE_DAYS)
+    alert(existing.length ? `backup episodica obsoleto: ${ageDays.toFixed(0)}d (>${EPISODIC_STALE_DAYS}d)` : 'no hay backup de la episodica (1.5GB) — sin DR');
+  // COSTO: si el tarball mas reciente es suficientemente fresco, no re-comprimimos (es pesado).
+  if (ageDays < EPISODIC_REFRESH_DAYS) { log(`episodic backup: fresco (${ageDays.toFixed(1)}d < ${EPISODIC_REFRESH_DAYS}d) — se omite recompresion`); return; }
+  const out = join(destDir, `episodic-superpowers-${ts.slice(0, 10)}.tar.gz`).replace(/\\/g, '/');
+  try {
+    // cwd=cfgDir + miembro 'superpowers' => extrae como 'superpowers/' (lo que espera restore.mjs).
+    // SABOR DE TAR (audit#2): el backup va a un path con letra de unidad ('G:/...'). Hay dos tar incompatibles:
+    //   - bsdtar (C:\Windows\system32\tar.exe, el del Task Scheduler) RECHAZA --force-local (exit 1) pero
+    //     comprime/lista OK sin el flag (no confunde 'G:' con host remoto).
+    //   - GNU tar (MSYS/Git en PATH interactivo) SI trata 'G:' como host remoto sin el flag ('Cannot connect to G:')
+    //     y NECESITA --force-local para tomarlo como path local.
+    // Ningun unico modo sirve para ambos -> intentamos SIN el flag (sirve a bsdtar) y, si falla, reintentamos
+    // CON --force-local (sirve a GNU tar). Asi el DR se genera bajo el tar real del scheduler y bajo el de Git.
+    try {
+      sh('tar', ['-czf', out, 'superpowers'], { cwd: cfgDir });
+    } catch (e1) {
+      // bare fallo: probablemente GNU tar interpretando 'G:' como host remoto -> reintentar con --force-local.
+      sh('tar', ['--force-local', '-czf', out, 'superpowers'], { cwd: cfgDir });
+    }
+    log('episodic backup ->', out);
+    // ROTACION: borra los mas viejos dejando EPISODIC_KEEP (cuenta el recien creado).
+    let after = [];
+    try { after = readdirSync(destDir).filter(f => /episodic-superpowers.*\.tar\.gz$/.test(f))
+        .map(f => ({ f, m: statSync(join(destDir, f)).mtimeMs })).sort((a, b) => b.m - a.m); } catch {}
+    for (const old of after.slice(EPISODIC_KEEP)) { try { rmSync(join(destDir, old.f)); log('episodic backup: rotado (borrado)', old.f); } catch {} }
+  } catch (e) {
+    // tar ausente o fallo: alertar, NO romper el resto del maintain (fallo silencioso prohibido).
+    log('episodic backup FALLO:', e.message.slice(0, 80));
+    alert('no se pudo respaldar la episodica (tar ausente o error): ' + e.message.slice(0, 100));
+  }
+}
+
 function main() {
   const lock = acquireLock();
   if (!lock) { log('otro job tiene el lock (.brain.lock fresco) — abort para no solapar'); return; }
@@ -120,12 +173,26 @@ function run() {
 
   // 2.6) NORMALIZE AUTOMATICO (Fase 0): si validate fallo SOLO por nodos no-v3 y el arbol esta limpio, repararlos.
   //      Cierra el lazo de la memoria nativa sin intervencion humana. Nunca toca nodos que el humano edito.
+  //      ATOMICO (audit#4): si tras normalize el re-validate sigue rojo (habia errores NO-normalizables:
+  //      wikilink roto, sin frontmatter, dominio sin digest, superseded_by colgante, N0 sobre techo),
+  //      revertimos EXACTAMENTE los nodos que normalize toco (git checkout --) para no dejar el arbol
+  //      sucio a medias (eso wedgea el pipeline: consolidate aborta, maintain salta). El gate de arbol-limpio
+  //      garantiza que cualquier cosa dirty tras normalize la produjo normalize -> revertir es seguro.
   if (treeClean && !validateOk && !DRY) {
     try {
       const nout = sh('node', [join(BRAIN, 'brain.mjs'), 'normalize', '--mem', MEM]);
       log('normalize auto:', nout.trim().split('\n')[0]);
+      // nodos que normalize dejo dirty (lista exacta, antes de re-validar). -z: NUL-terminado, sin comillado
+      // (robusto ante nombres con espacios/UTF-8, fix Low audit#4); cada entrada es 'XY <path>\0'.
+      const touched = sh('git', ['-C', MEM, 'status', '--porcelain', '-z']).split('\0')
+        .map(l => l.slice(3)).filter(Boolean);
       try { sh('node', [join(BRAIN, 'brain.mjs'), 'validate', '--mem', MEM]); validateOk = true; report.steps.normalized = true; log('validate OK tras normalize'); }
-      catch { log('validate sigue en rojo tras normalize (errores no-normalizables)'); alert('validate en rojo tras normalize (revisar manual)'); }
+      catch {
+        // re-validate ROJO: habia error(es) no-normalizable(s). Revertir lo tocado para dejar el arbol como estaba.
+        if (touched.length) { try { sh('git', ['-C', MEM, 'checkout', '--', ...touched]); report.steps.normalizeReverted = touched.length; log(`normalize REVERTIDO (${touched.length} nodo[s]): el re-validate seguia rojo por errores no-normalizables`); } catch (re) { log('WARN: revert de normalize fallo:', re.message.slice(0, 80)); alert('normalize dejo el arbol sucio y el revert FALLO (revisar manual)'); } }
+        else log('validate sigue en rojo tras normalize, pero normalize no toco nada (errores no-normalizables)');
+        alert('validate en rojo tras normalize (errores no-normalizables; cambios de normalize revertidos)');
+      }
     } catch (e) { log('normalize fallo:', e.message.slice(0, 80)); }
   }
 
@@ -168,6 +235,7 @@ function run() {
   // 7) backup: copia directa (cpSync). Si el destino NO esta disponible -> ALERTA (no skip silencioso).
   if (!DRY) {
     const dst = join(BACKUP_DIR, report.ts.slice(0, 10) + '-auto');
+    let destOk = true;
     try {
       mkdirSync(dst, { recursive: true });
       cpSync(MEM, join(dst, 'memory'), { recursive: true });
@@ -175,7 +243,10 @@ function run() {
         if (existsSync(join(BRAIN, f))) cpSync(join(BRAIN, f), join(dst, 'claude-brain', f));
       if (existsSync(join(BRAIN, 'visor', 'index.html'))) cpSync(join(BRAIN, 'visor', 'index.html'), join(dst, 'claude-brain', 'visor', 'index.html'));
       report.steps.backup = dst; log('backup ->', dst);
-    } catch (e) { report.steps.backup = 'FALLO'; log('backup FALLO:', e.message.slice(0, 80)); alert(`backup omitido: destino ${BACKUP_DIR} no disponible`); }
+    } catch (e) { destOk = false; report.steps.backup = 'FALLO'; log('backup FALLO:', e.message.slice(0, 80)); alert(`backup omitido: destino ${BACKUP_DIR} no disponible`); }
+    // 7b) DR de la episodica (audit#4): tarball rotado + alerta de obsolescencia. Va al BACKUP_DIR raiz
+    //     (no al subdir -auto del dia) para que la rotacion cruce corridas y restore.mjs lo halle con --from <BACKUP_DIR>.
+    if (destOk) backupEpisodic(BACKUP_DIR, report.ts);
   } else log('backup: (dry)');
 
   // 8) SYSTEM-STATE.md desde la realidad (incluye validate y tope blando)

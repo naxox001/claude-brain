@@ -297,6 +297,13 @@ function capture() {
   const sid = (input.session_id || input.sessionId || 'desconocida').toString().slice(0, 24).replace(/[^a-zA-Z0-9_-]/g, '');
   const tp = input.transcript_path || input.transcriptPath || '';
   const cwd = input.cwd || input.workingDirectory || '';
+  // GUARD anti-auto-ingestion recursiva (audit#4): el consolidador spawnea `claude -p` con BRAIN_CONSOLIDATING
+  // seteado; si esa sub-sesion dispara el hook Stop, NO debe auto-depositar un puntero a su propio transcript.
+  // Tambien NO-OP si la sesion corre DENTRO de MEM (cwd en la carpeta de memoria = es el propio consolidador).
+  if (process.env.BRAIN_CONSOLIDATING) process.exit(0);
+  const norm = p => String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const cwdN = norm(cwd), memN = norm(MEM);
+  if (cwdN && memN && (cwdN === memN || cwdN.startsWith(memN + '/'))) process.exit(0);
   const inbox = join(MEM, 'inbox'); if (!existsSync(inbox)) mkdirSync(inbox, { recursive: true });
   const note = join(inbox, `_session_${sid}.md`);
   if (existsSync(note)) { process.exit(0); } // idempotente: una sesion, una nota

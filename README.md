@@ -78,7 +78,7 @@ cd visor && python -m http.server 8777   # -> http://localhost:8777
 - **Validar / ver salud:** `node brain.mjs validate` (también corre en cada inicio de sesión vía el hook).
 - **Ver el cerebro:** abre el visor.
 
-El resto ocurre **solo** (lazo cerrado): un hook `Stop` (`brain.mjs capture`) deposita un puntero de cada sesión en `inbox/` (gitignored, no ensucia el árbol); el **consolidador nocturno** lee esos punteros + sus transcripts y extrae memorias durables a los digests; el **mantenedor semanal** valida, normaliza nodos mal formados, drena la sección Inbox del índice, archiva cerrados y respalda. Todo **serializado con un lock** y con gates que abortan ante un árbol sucio, secretos o cambios fuera de contrato, con auto-rollback.
+El resto corre **en background, semi-automático**: un hook `Stop` (`brain.mjs capture`) deposita un puntero de cada sesión en `inbox/` (gitignored, no ensucia el árbol); el **consolidador nocturno** lee esos punteros + sus transcripts y extrae memorias durables a los digests; el **mantenedor semanal** valida, normaliza nodos mal formados, drena la sección Inbox del índice, archiva cerrados y respalda. Todo **serializado con un lock** y con gates que abortan ante un árbol sucio, secretos o cambios fuera de contrato, con auto-rollback. El consolidador corre cuando el árbol de memoria está limpio; **si hay WIP sin commitear de otra sesión, se posterga hasta el próximo ciclo** (el aislamiento en git-worktree que lo dejaría correr aun con WIP presente está pendiente — ver más abajo). En la práctica, con WIP crónico el lazo no se cierra solo: queda como un paso manual (commitear o esperar).
 
 > **Deferido a propósito** (ver auditorías): aislar el consolidador en un git-worktree para correr aun con WIP de otra sesión presente; flip completo al formato nativo como entrada (medir frecuencia primero); embeddings locales como re-ranker (solo si BM25 resulta insuficiente).
 
@@ -94,6 +94,16 @@ El installer registra las tareas automáticas **solo en Windows** (Task Schedule
 ```
 
 El destino de backup es configurable en `~/.claude/brain.json` (`"backupDir": "..."`); por defecto `G:/respaldo-memoria-claude` (Windows).
+
+### Qué respalda (y qué no)
+
+Sé honesto con la cadencia real de respaldo:
+
+- **Markdown + código:** se copian al `backupDir` en **cada `maintain` (semanal)**. Es lo que reconstruye el cerebro en otra máquina.
+- **Memoria episódica / transcripts pesados:** **solo** vía tarball (ahora con rotación — ver el fix de `maintain`); no se copian sueltos en cada corrida.
+- **Transcripts referenciados por punteros** (los que deja el hook `capture` en `inbox/`): son **referencias, no copias** — **NO se respaldan** salvo que entren explícitamente al backup frío (tarball). Si pierdes los transcripts originales, el consolidador ya no podrá re-extraer de ellos.
+
+En resumen: el backup garantiza markdown + código (la fuente de verdad y todo lo regenerable); la episódica queda cubierta solo por el tarball rotado; los transcripts crudos quedan fuera mientras vivan únicamente como punteros.
 
 ## Frontmatter v3
 
