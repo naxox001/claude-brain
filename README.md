@@ -7,7 +7,9 @@ externa, sin dependencias npm.
 
 > Nació reemplazando un sistema de 7 capas (2 vector stores, 2 plugins conversacionales, journal,
 > markdown duplicado) que costaba ~7.200 tokens fijos por sesión y crecía sin techo. El resultado:
-> **~2.600 tokens fijos, constantes a 3 años**, una sola fuente de verdad, y todo regenerable.
+> una **parte generada del índice de ~2.600 tokens que crece O(dominios), no O(memorias)** (reglas
+> duras + 1 línea por dominio), una sola fuente de verdad, y todo regenerable. La sección Inbox del
+> índice es transitoria y la drena el mantenedor; el detalle por dominio se carga bajo demanda.
 
 ## Por qué
 
@@ -35,10 +37,11 @@ conocimiento en un vector store opaco que se desincroniza. `claude-brain` evita 
 
 ## Componentes
 
-- **`brain.mjs`** — `render-index` (genera el N0 con tope) y `validate` (estructura, wikilinks, contradicciones).
+- **`brain.mjs`** — `render-index` (genera el N0), `validate` (estructura, wikilinks, contradicciones: un nodo `vigente` con `superseded_by` se marca como error), `add`, `normalize`, `drain-inbox`, `capture`.
 - **`graph.mjs`** — `build` (grafo en SQLite), `query` (FTS5 + vecindario de 1 salto), `export-3d` (JSON para el visor).
+- **`lib.mjs`** — fuente única del parser v3 (`parseFrontmatter`/`parseScalar`, importado por `brain.mjs` y `graph.mjs`) + escritura atómica (`writeAtomic`, tmp+rename) de los derivados.
 - **`maintain.mjs`** — mantenedor semanal determinista: valida, escanea secretos (redactados), archiva cerrados >60d, regenera derivados, respalda, genera `SYSTEM-STATE.md`.
-- **`consolidate.mjs`** — consolidador nocturno: integra notas de `inbox/` a los digests vía `claude -p`; **si `validate` falla tras consolidar, hace rollback automático** (`git reset --hard`).
+- **`consolidate.mjs`** — consolidador nocturno: integra notas de `inbox/` a los digests vía `claude -p`. Si falla `validate`, el gate diferencial (borrado/`MEMORY.md`/cuerpo de nodo/**vaciado de digest**), el escaneo de secretos, el LLM hace timeout, o falla la regeneración/commit → **rollback automático SELECTIVO**: revierte sólo el scope del LLM (`digests/` + derivados) y limpia sólo sus untracked nuevos, **preservando el WIP de otra sesión** (no usa `reset --hard` global), y re-encola las notas movidas.
 - **`install.mjs`** / **`restore.mjs`** — instalación de 1 comando y restauración de datos desde backup.
 - **`visor/index.html`** — mapa cerebral 3D interactivo.
 
@@ -51,9 +54,14 @@ conocimiento en un vector store opaco que se desincroniza. `claude-brain` evita 
 
 ```bash
 git clone <este-repo> ~/projects/claude-brain
-git clone <tu-repo-privado-de-memoria> ~/.claude/projects/<slug>/memory   # tus datos
+# 1) descubre tu <slug> (Claude Code codifica el HOME: cada caracter no-alfanumérico -> '-'):
+node -e "console.log((process.env.USERPROFILE||process.env.HOME).replace(/[^a-zA-Z0-9]/g,'-'))"
+# 2) clona tus datos a esa ruta (reemplaza <slug> por lo que imprimió el paso 1):
+git clone <tu-repo-privado-de-memoria> ~/.claude/projects/<slug>/memory
 node ~/projects/claude-brain/install.mjs
 ```
+
+> El `<slug>` no es trivial de calcular a mano (sobre todo en Windows, donde codifica `C:\Users\tu` → `C--Users-tu`); el one-liner de arriba lo imprime exacto. Alternativa: corre `node ~/projects/claude-brain/install.mjs --dry-run` primero — imprime `MEM=` con la ruta resuelta.
 
 `install.mjs` escribe `~/.claude/brain.json`, instala el hook de health-check, cablea el
 `SessionStart` en `settings.json` (idempotente), genera los derivados y registra las tareas
@@ -123,7 +131,7 @@ metadata:
 
 ## Garantías de diseño
 
-- **Tokens fijos acotados:** el N0 tiene tope duro; al excederlo, avisa y compacta.
+- **Tokens acotados:** el N0 avisa (WARNING) si supera el cap blando (7168 bytes) y el hook de inicio lo señala; la compactación es **manual** (editar descriptions/reglas y regenerar, o dejar que el mantenedor drene el Inbox). El harness trunca por encima de 25000 bytes (techo duro real). La parte generada (reglas + 1 línea/dominio) crece O(dominios).
 - **Cero pérdida:** cerrados → `archivo/` (git, grep-able); los wikilinks resuelven cross-directorio.
 - **Portable:** una copia de `memory/` + un `git clone` reconstruyen todo en otra máquina (ensayado).
 - **Auditable:** cada corrida autónoma es 1 commit git; el consolidador se auto-revierte si rompe la estructura.

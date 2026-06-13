@@ -26,7 +26,8 @@ console.log(`\n=== install claude-brain ===\nHOME=${HOME}\nMEM=${MEM}\n`);
 
 // 1) preflight
 const ver = process.versions.node.split('.').map(Number);
-if (ver[0] < 22) { console.error(`Node ${process.versions.node} < 22 (se necesita node:sqlite + fs.cpSync)`); process.exit(1); }
+// >=22.5: node:sqlite llega en 22.5 (audit#5 #44: antes el gate era <22 y dejaba pasar 22.0-22.4 sin node:sqlite).
+if (ver[0] < 22 || (ver[0] === 22 && ver[1] < 5)) { console.error(`Node ${process.versions.node} < 22.5 (se necesita node:sqlite + fs.cpSync)`); process.exit(1); }
 try { await import('node:sqlite'); log('preflight: node', process.versions.node, '+ node:sqlite OK'); }
 catch { console.error('node:sqlite no disponible en este Node'); process.exit(1); }
 
@@ -50,7 +51,11 @@ if (settings) {
   let touched = false;
   const wire = (evt, script, timeout) => {
     settings.hooks[evt] = settings.hooks[evt] || [];
-    if (!JSON.stringify(settings.hooks[evt]).includes(script)) {
+    // deteccion PRECISA (audit#5 G1): buscar nuestro comando real (ruta del hook) en los command[] de cada
+    // entrada, no un JSON.stringify(...).includes(script) que daria falso positivo si 'brain-session-start.sh'
+    // aparece como substring en CUALQUIER hook ajeno (matcher, comentario) -> dejaria al usuario SIN hook.
+    const present = settings.hooks[evt].some(g => Array.isArray(g.hooks) && g.hooks.some(h => typeof h.command === 'string' && h.command.includes(`/.claude/hooks/${script}`)));
+    if (!present) {
       settings.hooks[evt].push({ matcher: '.*', hooks: [{ type: 'command', command: `bash "$HOME/.claude/hooks/${script}" 2>/dev/null || true`, timeout }] });
       touched = true; log(`settings.json: ${evt} -> ${script} agregado`);
     } else log(`settings.json: ${evt} ${script} ya presente (idempotente)`);

@@ -7,6 +7,7 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { resolveMem } from './brain.config.mjs';
+import { parseFrontmatter, writeAtomic } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -17,48 +18,7 @@ const N0_CAP = 7168;          // tope duro del indice generado (bytes)
 const HARNESS_CAP = 25000;    // techo de truncamiento del harness (referencia)
 const INBOX_MARKER = '## Inbox (nuevas entradas — el consolidador las integra)';
 
-// --- parser de frontmatter (subset YAML suficiente para el esquema v3) ---
-function parseFrontmatter(raw) {
-  raw = raw.replace(/\r\n/g, '\n');  // CRLF-safe (fix audit 2026-06-13): Windows/consolidador puede escribir CRLF
-  if (!raw.startsWith('---')) return null;
-  const end = raw.indexOf('\n---', 3);
-  if (end < 0) return null;
-  const block = raw.slice(3, end);
-  const fm = { metadata: {} };
-  let inMeta = false;
-  for (const line of block.split('\n')) {
-    if (!line.trim()) continue;
-    const metaChild = /^\s{2,}(\w[\w-]*):\s*(.*)$/.exec(line);
-    if (inMeta && metaChild && /^\s/.test(line)) {
-      fm.metadata[metaChild[1]] = parseScalar(metaChild[2]);
-      continue;
-    }
-    const top = /^(\w[\w-]*):\s*(.*)$/.exec(line);
-    if (top) {
-      inMeta = top[1] === 'metadata';
-      if (!inMeta) fm[top[1]] = parseScalar(top[2]);
-      // metadata inline: metadata: { type: x, ... }
-      if (inMeta && top[2].trim().startsWith('{')) {
-        for (const kv of top[2].replace(/[{}]/g, '').split(',')) {
-          const m = /\s*(\w[\w-]*):\s*(.+)\s*/.exec(kv);
-          if (m) fm.metadata[m[1]] = parseScalar(m[2].trim());
-        }
-        inMeta = false;
-      }
-    }
-  }
-  return { fm, body: raw.slice(end + 4) };
-}
-function parseScalar(s) {
-  s = String(s).trim();
-  const dq = s.startsWith('"') && s.endsWith('"');
-  s = s.replace(/^["']|["']$/g, '');
-  if (dq) s = s.replace(/\\"/g, '"').replace(/\\\\/g, '\\'); // unescape YAML double-quoted
-  if (s === 'true') return true;
-  if (s === 'false') return false;
-  if (s === 'null' || s === '') return null;
-  return s;
-}
+// parser de frontmatter v3: ahora vive en lib.mjs (fuente unica, importado arriba).
 
 // --- scan de la capa ---
 function scanLayer() {
@@ -89,14 +49,17 @@ function renderIndex() {
   const STATUS_OK = ['vigente', 'cerrado', 'pausado'];
   const discarded = nodes.filter(n => !n.fm || !n.fm.metadata.domain || !STATUS_OK.includes(n.fm.metadata.status));
   if (discarded.length) console.error(`[AVISO] render-index: ${discarded.length} nodo(s) con frontmatter v3 invalido NO entran al N0: ${discarded.map(n => n.stem).join(', ')}. Corre 'node brain.mjs validate' o 'node brain.mjs normalize'.`);
-  // PISO DE SEGURIDAD: si NO hay nodos VALIDOS pero el dir tiene .md, algo fallo (parser/ruta). No sobreescribir el N0.
-  const valid = nodes.filter(n => n.fm);
+  // PISO DE SEGURIDAD: si NO hay nodos v3 VALIDOS pero el dir tiene .md, algo fallo (parser/ruta). No sobreescribir el N0.
+  // Cuenta v3-validos (no solo parseables): un dir lleno de nodos rotos-pero-parseables NO debe vaciar el N0 (audit#5 #27).
+  const valid = nodes.filter(n => !discarded.includes(n));
   const mdOnDisk = existsSync(MEM) && readdirSync(MEM).some(f => f.endsWith('.md') && f !== 'MEMORY.md');
   if (valid.length === 0 && mdOnDisk) {
     console.error('[ABORT] render-index: 0 nodos validos parseados pero hay .md en disco. No se sobreescribe MEMORY.md (posible parser/ruta rota).');
     process.exit(1);
   }
-  const reglas = nodes.filter(n => n.fm && Number(n.fm.metadata.importance) >= 5 && !n.fm.metadata.digest)
+  // Reglas duras: importance>=5 Y vigente (audit#5 G10: una regla cerrada/pausada con importance 5 NO
+  // debe presentarse como "siempre vigente" en cada sesion; para retirar una regla basta cambiar su status).
+  const reglas = nodes.filter(n => n.fm && Number(n.fm.metadata.importance) >= 5 && !n.fm.metadata.digest && n.fm.metadata.status === 'vigente')
     .sort((a, b) => a.stem.localeCompare(b.stem));
   const digests = nodes.filter(n => n.fm && n.fm.metadata.digest)
     .sort((a, b) => String(a.fm.metadata.domain).localeCompare(String(b.fm.metadata.domain)));
@@ -160,9 +123,9 @@ function renderIndex() {
   if (bytes > N0_CAP) {
     console.error(`[WARNING] N0 generado = ${bytes} bytes > cap ${N0_CAP}. Escrito igual (harness trunca a ${HARNESS_CAP}); compacta reglas/descriptions y regenera.`);
   }
-  writeFileSync(memPath, out);
+  writeAtomic(memPath, out);  // atomico (audit#5 G3): un kill-9/ENOSPC a mitad no deja el N0 truncado
   if (!existsSync(join(MEM, 'archivo'))) mkdirSync(join(MEM, 'archivo'));
-  writeFileSync(join(MEM, 'archivo', 'CATALOGO.md'), C.join('\n') + '\n');
+  writeAtomic(join(MEM, 'archivo', 'CATALOGO.md'), C.join('\n') + '\n');
   console.log(`N0 escrito: ${bytes} bytes (cap ${N0_CAP}, margen ${N0_CAP - bytes}) · reglas=${reglas.length} dominios=${digests.length} · catalogo=${cerrados.length} cerrados`);
 }
 
@@ -182,6 +145,11 @@ function validate() {
     if (!STATUS.has(n.fm.metadata.status)) errors.push(`${n.file}: status invalido "${n.fm.metadata.status}"`);
     if (n.fm.metadata.superseded_by && !stems.has(String(n.fm.metadata.superseded_by))) {
       errors.push(`${n.file}: superseded_by apunta a nodo inexistente "${n.fm.metadata.superseded_by}"`);
+    }
+    // contradiccion (audit#5 G9): un nodo VIGENTE que declara superseded_by deberia estar cerrado/pausado.
+    // Esto hace real la deteccion de "contradicciones" que el README promete y la deja como gate del lazo.
+    if (n.fm.metadata.superseded_by && n.fm.metadata.status === 'vigente') {
+      errors.push(`${n.file}: contradiccion — status vigente pero superseded_by="${n.fm.metadata.superseded_by}" (deberia estar cerrado/pausado)`);
     }
     for (const m of n.body.matchAll(/\[\[([^\]\n]+)\]\]/g)) {
       const t = m[1].trim();
@@ -227,9 +195,10 @@ function addNode() {
   }
   name = name.replace(/[^a-zA-Z0-9_]+/g, '_').toLowerCase().replace(/^_|_$/g, '');
   if (!name) { console.error('--name quedo vacio tras sanitizar; usa al menos un caracter alfanumerico'); process.exit(2); }
+  if (!existsSync(MEM)) { console.error('El dir de memoria no existe: ' + MEM); process.exit(2); }
   const path = join(MEM, name + '.md');
   if (existsSync(path)) { console.error('Ya existe: ' + path); process.exit(1); }
-  const d = /[:#"]/.test(desc) ? JSON.stringify(desc) : desc;
+  const d = /[:#"\n\r]/.test(desc) ? JSON.stringify(desc) : desc;  // sanitiza tambien saltos de linea (audit#5 #17)
   const fm = `---\nname: ${name}\ndescription: ${d}\nmetadata:\n  type: ${type}\n  domain: ${domain}\n  status: ${status}\n  valid_from: ${valid}\n  importance: ${importance}\n---\n\n# ${name.replace(/_/g, ' ')}\n\n`;
   writeFileSync(path, fm);
   console.log(`Creado nodo v3: ${path}`);
@@ -253,12 +222,12 @@ function normalize() {
       meta.valid_from = md.valid_from || today();
       meta.importance = md.importance || 2;
       const desc = n.fm.description || n.stem.replace(/_/g, ' ');
-      const d = /[:#"]/.test(String(desc)) ? JSON.stringify(desc) : desc;
+      const d = /[:#"\n\r]/.test(String(desc)) ? JSON.stringify(desc) : desc;  // sanitiza saltos (audit#5 #17)
       let block = `---\nname: ${expectedName}\ndescription: ${d}\nmetadata:\n`;
       for (const [k, v] of Object.entries(meta)) block += `  ${k}: ${v}\n`;
       block += '---\n';
       const full = join(MEM, n.file);
-      if (!dry) writeFileSync(full, block + n.body);
+      if (!dry) writeAtomic(full, block + n.body);
       fixed.push(`${n.stem} (domain=${meta.domain}, status=${meta.status})`);
     }
   }
@@ -278,13 +247,14 @@ function drainInbox() {
   if (i < 0) { console.log('sin seccion Inbox'); return; }
   const body = cur.slice(i + INBOX_MARKER.length).replace(/^\n+/, '').trim();
   if (!body || body === '<!-- vacio -->') { console.log('Inbox vacio — nada que drenar'); return; }
-  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 16);
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);  // granularidad de SEGUNDOS (audit#5 #37)
   const dst = join(MEM, 'inbox'); if (!existsSync(dst)) mkdirSync(dst, { recursive: true });
-  const note = join(dst, `_pending_${stamp}.md`);
+  let note = join(dst, `_pending_${stamp}.md`);
+  for (let k = 2; existsSync(note); k++) note = join(dst, `_pending_${stamp}_${k}.md`);  // no sobreescribir una nota previa
   if (DRY) { console.log(`[dry] drenaria ${body.length} chars del Inbox -> ${note}`); return; }
-  writeFileSync(note, `# Nota cruda drenada del Inbox de N0 (${stamp})\n\n${body}\n`);
+  writeAtomic(note, `# Nota cruda drenada del Inbox de N0 (${stamp})\n\n${body}\n`);
   // limpia la seccion Inbox del N0 (render-index la regenera vacia luego)
-  writeFileSync(memPath, cur.slice(0, i + INBOX_MARKER.length) + '\n<!-- vacio -->\n');
+  writeAtomic(memPath, cur.slice(0, i + INBOX_MARKER.length) + '\n<!-- vacio -->\n');
   console.log(`Inbox drenado -> ${note} (${body.length} chars). Corre el consolidador o render-index.`);
 }
 
@@ -294,9 +264,16 @@ function drainInbox() {
 function capture() {
   let input = {};
   try { input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* sin stdin valido: nota minima */ }
-  const sid = (input.session_id || input.sessionId || 'desconocida').toString().slice(0, 24).replace(/[^a-zA-Z0-9_-]/g, '');
   const tp = input.transcript_path || input.transcriptPath || '';
   const cwd = input.cwd || input.workingDirectory || '';
+  let sid = (input.session_id || input.sessionId || '').toString().slice(0, 24).replace(/[^a-zA-Z0-9_-]/g, '');
+  // sin session_id: derivar un id ESTABLE del transcript (idempotente para la misma sesion) o, en ultimo caso,
+  // uno unico por proceso. Asi dos sesiones sin id NO colapsan en _session_desconocida.md perdiendo un puntero (audit#5 #42).
+  if (!sid) {
+    const basis = tp || (String(process.pid) + '-' + Date.now());
+    let h = 5381; for (let k = 0; k < basis.length; k++) h = ((h * 33) ^ basis.charCodeAt(k)) >>> 0;
+    sid = 'anon-' + h.toString(36);
+  }
   // GUARD anti-auto-ingestion recursiva (audit#4): el consolidador spawnea `claude -p` con BRAIN_CONSOLIDATING
   // seteado; si esa sub-sesion dispara el hook Stop, NO debe auto-depositar un puntero a su propio transcript.
   // Tambien NO-OP si la sesion corre DENTRO de MEM (cwd en la carpeta de memoria = es el propio consolidador).
@@ -308,7 +285,7 @@ function capture() {
   const note = join(inbox, `_session_${sid}.md`);
   if (existsSync(note)) { process.exit(0); } // idempotente: una sesion, una nota
   const stamp = new Date().toISOString().slice(0, 16);
-  writeFileSync(note, `# Sesion ${sid} (${stamp})\n\ncwd: ${cwd}\ntranscript: ${tp}\n\nPendiente: el consolidador debe leer el transcript y extraer SOLO memorias durables (decisiones, lecciones, hechos nuevos); descartar lo efimero.\n`);
+  writeAtomic(note, `# Sesion ${sid} (${stamp})\n\ncwd: ${cwd}\ntranscript: ${tp}\n\nPendiente: el consolidador debe leer el transcript y extraer SOLO memorias durables (decisiones, lecciones, hechos nuevos); descartar lo efimero.\n`);
   process.exit(0);
 }
 

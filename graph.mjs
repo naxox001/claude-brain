@@ -4,13 +4,14 @@
 // El markdown sigue siendo la fuente de verdad; este grafo es solo un indice de consulta + insumo del visor 3D.
 // Uso: node graph.mjs <build|query|export-3d> [texto] [--mem <dir>] [--out <dir>]
 //
-// NOTA DE SINCRONIZACION: parseFrontmatter/parseScalar/scanLayer son copia deliberada de brain.mjs
-// (mismo esquema v3). Si cambia el parser alla, reflejarlo aca. Refactor a lib.mjs comun = tarea de cleanup E6.
+// El parser v3 (parseFrontmatter/parseScalar) vive en lib.mjs (fuente UNICA, compartida con brain.mjs):
+// ya no hay copia que pueda divergir (audit#5: el viejo test de "paridad" entre copias era falso-verde).
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, statSync, mkdirSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { resolveMem, BRAIN_DIR } from './brain.config.mjs';
+import { parseFrontmatter, writeAtomic } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -22,44 +23,6 @@ const OUT = outIdx >= 0 ? args[outIdx + 1] : BRAIN;
 const DB_PATH = join(OUT, 'derived', 'graph.db');
 const JSON_PATH = join(OUT, 'visor', 'graph.json');
 
-// ---- parser (sync con brain.mjs) ----
-function parseScalar(s) {
-  s = String(s).trim();
-  const dq = s.startsWith('"') && s.endsWith('"');
-  s = s.replace(/^["']|["']$/g, '');
-  if (dq) s = s.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-  if (s === 'true') return true;
-  if (s === 'false') return false;
-  if (s === 'null' || s === '') return null;
-  return s;
-}
-function parseFrontmatter(raw) {
-  raw = raw.replace(/\r\n/g, '\n');  // CRLF-safe (sync con brain.mjs, fix audit 2026-06-13)
-  if (!raw.startsWith('---')) return null;
-  const end = raw.indexOf('\n---', 3);
-  if (end < 0) return null;
-  const block = raw.slice(3, end);
-  const fm = { metadata: {} };
-  let inMeta = false;
-  for (const line of block.split('\n')) {
-    if (!line.trim()) continue;
-    const metaChild = /^\s{2,}(\w[\w-]*):\s*(.*)$/.exec(line);
-    if (inMeta && metaChild && /^\s/.test(line)) { fm.metadata[metaChild[1]] = parseScalar(metaChild[2]); continue; }
-    const top = /^(\w[\w-]*):\s*(.*)$/.exec(line);
-    if (top) {
-      inMeta = top[1] === 'metadata';
-      if (!inMeta) fm[top[1]] = parseScalar(top[2]);
-      if (inMeta && top[2].trim().startsWith('{')) {
-        for (const kv of top[2].replace(/[{}]/g, '').split(',')) {
-          const m = /\s*(\w[\w-]*):\s*(.+)\s*/.exec(kv);
-          if (m) fm.metadata[m[1]] = parseScalar(m[2].trim());
-        }
-        inMeta = false;
-      }
-    }
-  }
-  return { fm, body: raw.slice(end + 4) };
-}
 function scanLayer(mem) {
   const nodes = [];
   for (const [dir, prefix] of [[mem, ''], [join(mem, 'digests'), 'digests/'], [join(mem, 'archivo'), 'archivo/']]) {
@@ -107,8 +70,9 @@ function buildModel() {
     const stem = n.stem, md = n.fm.metadata;
     // member: nodo -> digest de su dominio (estructura de lobulos)
     if (!md.digest && digestOf[md.domain]) addEdge(stem, digestOf[md.domain], 'member');
-    // supersedes (temporal)
-    if (md.superseded_by) addEdge(stem, String(md.superseded_by), 'supersedes');
+    // supersedes (temporal): A con `superseded_by: B` significa "B reemplaza a A" -> arista B --supersedes--> A.
+    // (audit#5 #28: antes A->B, direccion invertida respecto a la etiqueta). byStem.has guarda que el src exista.
+    if (md.superseded_by && byStem.has(String(md.superseded_by))) addEdge(String(md.superseded_by), stem, 'supersedes');
     // relates (lista inline [a, b])
     if (md.relates) for (const r of String(md.relates).replace(/[[\]]/g, '').split(',').map(s => s.trim()).filter(Boolean)) addEdge(stem, r, 'relates');
     // wikilinks del cuerpo (sinapsis cross-dominio = lo interesante)
@@ -147,8 +111,12 @@ function build() {
 
 function query(text) {
   if (!text) { console.error('query requiere texto'); process.exit(2); }
+  // db DERIVADA: si falta o esta CORRUPTA (corte a mitad de build, disco lleno) se reconstruye (audit#5 #26),
+  // igual que el caso ausente; antes una db corrupta crasheaba toda consulta y exigia borrarla a mano.
   if (!existsSync(DB_PATH)) build();
-  const db = new DatabaseSync(DB_PATH);
+  let db;
+  try { db = new DatabaseSync(DB_PATH); db.prepare('SELECT 1 FROM nodes LIMIT 1').get(); }
+  catch { try { db && db.close(); } catch {} try { rmSync(DB_PATH, { force: true }); } catch {} build(); db = new DatabaseSync(DB_PATH); }
   let rows;
   try {
     // PRECISION (audit#3): BM25 con peso por campo (name >> description >> body) + AND-primero, OR como fallback.
@@ -182,7 +150,7 @@ function export3d() {
     links: edges.map(e => ({ source: e.src, target: e.dst, rel: e.rel })),
   };
   mkdirSync(join(OUT, 'visor'), { recursive: true });
-  writeFileSync(JSON_PATH, JSON.stringify(out, null, 0));
+  writeAtomic(JSON_PATH, JSON.stringify(out, null, 0));  // atomico (audit#5 G3)
   const domains = [...new Set(nodes.map(n => n.domain))].length;
   console.log(`export-3d OK: ${out.nodes.length} nodos, ${out.links.length} links, ${domains} dominios -> ${JSON_PATH}`);
 }

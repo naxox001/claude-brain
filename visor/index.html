@@ -54,7 +54,11 @@ let colorFor = () => '#888';  // se reasigna al cargar data (segun dominios pres
 const REL_COLORS = { member:'rgba(120,130,150,.18)', wikilink:'rgba(120,180,255,.38)', supersedes:'#ff4d6d', relates:'rgba(180,255,180,.4)' };
 const STATUS_OPACITY = { vigente:1, pausado:.6, cerrado:.32, archivado:.32 };
 
-function fail(msg){ document.body.insertAdjacentHTML('beforeend','<div class="err">'+msg+'</div>'); }
+function fail(msg){ document.body.insertAdjacentHTML('beforeend','<div class="err">'+esc(msg)+'</div>'); }
+// escape HTML (audit#5 G6): name/domain/status/type vienen del frontmatter (lo escribe el usuario o el LLM
+// consolidador). Sin escapar, un nodo con name "<img src=x onerror=...>" inyectaria script en el visor (XSS
+// almacenado) al renderizarse via innerHTML (nodeLabel, leyenda, badges). textContent ya es seguro; esto cubre el resto.
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 fetch('./graph.json').then(r=>{ if(!r.ok) throw new Error('graph.json '+r.status); return r.json(); }).then(data=>{
   if(!window.ForceGraph3D){ fail('No se pudo cargar 3d-force-graph (sin conexión a CDN). El grafo igual existe en graph.json y graph.db.'); return; }
@@ -72,7 +76,7 @@ fetch('./graph.json').then(r=>{ if(!r.ok) throw new Error('graph.json '+r.status
   const leg = document.getElementById('legend');
   leg.innerHTML = '<div style="color:var(--muted);margin-bottom:6px">dominios (lóbulos)</div>' +
     Object.entries(domains).sort((a,b)=>b[1]-a[1]).map(([d,n])=>
-      `<div class="row" data-d="${d}"><span class="dot" style="background:${colorFor(d)}"></span>${d}<span class="n">${n}</span></div>`).join('');
+      `<div class="row" data-d="${esc(d)}"><span class="dot" style="background:${colorFor(d)}"></span>${esc(d)}<span class="n">${n}</span></div>`).join('');
 
   const Graph = ForceGraph3D()(document.getElementById('graph'))
     .backgroundColor('#0a0e14')
@@ -82,7 +86,7 @@ fetch('./graph.json').then(r=>{ if(!r.ok) throw new Error('graph.json '+r.status
     .nodeColor(n => colorFor(n.domain))
     .nodeOpacity(0.92)
     .nodeLabel(n => `<div style="font:13px sans-serif;color:#fff;background:#111a;padding:4px 8px;border-radius:6px">
-        <b>${n.name}</b><br><span style="color:#9fb">${n.domain}</span> · ${n.status}${n.isDigest?' · <i>digest</i>':''}</div>`)
+        <b>${esc(n.name)}</b><br><span style="color:#9fb">${esc(n.domain)}</span> · ${esc(n.status)}${n.isDigest?' · <i>digest</i>':''}</div>`)
     .linkColor(l => REL_COLORS[l.rel] || 'rgba(255,255,255,.2)')
     .linkOpacity(0.5)
     .linkWidth(l => l.rel==='supersedes'?1.5:0.4)
@@ -92,9 +96,9 @@ fetch('./graph.json').then(r=>{ if(!r.ok) throw new Error('graph.json '+r.status
       const info=document.getElementById('info'); info.style.display='block';
       document.getElementById('i-name').textContent=n.name;
       document.getElementById('i-meta').innerHTML=
-        `<span class="badge" style="background:${colorFor(n.domain)};color:#000">${n.domain}</span>`+
-        `<span class="badge" style="background:#243140">${n.status}</span>`+
-        `<span class="badge" style="background:#243140">${n.type}</span>`;
+        `<span class="badge" style="background:${colorFor(n.domain)};color:#000">${esc(n.domain)}</span>`+
+        `<span class="badge" style="background:#243140">${esc(n.status)}</span>`+
+        `<span class="badge" style="background:#243140">${esc(n.type)}</span>`;
       document.getElementById('i-desc').textContent=n.id;
     });
 

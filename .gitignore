@@ -15,4 +15,5 @@ run-maintain.cmd
 run-consolidate.cmd
 MAINTAIN-ALERT.txt
 CONSOLIDATOR-ALERT.txt
-.brain.lock
+.brain*.lock
+SYSTEM-STATE.md

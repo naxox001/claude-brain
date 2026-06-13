@@ -4,10 +4,11 @@
 // Pasos: validate -> secret-scan -> auto-demote cerrados>60d a archivo/ -> render-index (N0) ->
 //        graph build + export-3d -> backup a G: -> SYSTEM-STATE.md -> git commit/push si hubo cambios.
 // Uso: node maintain.mjs [--dry-run] [--mem <dir>]
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, renameSync, mkdirSync, cpSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, lstatSync, renameSync, mkdirSync, cpSync, rmSync } from 'node:fs';
+import { join, basename } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, resolveBackupDir, acquireLock, releaseLock } from './brain.config.mjs';
+import { parseFrontmatter } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const DRY = args.includes('--dry-run');
@@ -21,7 +22,7 @@ const DEMOTE_DAYS = 60;
 // tamano de dir sin depender de 'du' (cross-platform)
 function dirSizeMB(dir) {
   let bytes = 0;
-  const walk = d => { for (const f of readdirSync(d)) { const p = join(d, f); const s = statSync(p); if (s.isDirectory()) walk(p); else bytes += s.size; } };
+  const walk = d => { for (const f of readdirSync(d)) { const p = join(d, f); const s = lstatSync(p); if (s.isSymbolicLink()) continue; if (s.isDirectory()) walk(p); else bytes += s.size; } };
   try { walk(dir); } catch { return null; }
   return (bytes / 1048576).toFixed(0);
 }
@@ -35,6 +36,7 @@ const SECRET_PATTERNS = [
   // OpenAI clasica + project + Anthropic + Stripe + HuggingFace (audit#3: el sk- generico no cubria los guiones)
   ['anthropic', /sk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{20,}/g],
   ['openai',   /sk-proj-[A-Za-z0-9_-]{20,}/g],
+  ['openai',   /sk-svcacct-[A-Za-z0-9_-]{20,}/g],   // service-account (audit#5 #30: el guion cortaba el sk- generico)
   ['openai',   /sk-[a-zA-Z0-9]{20,}/g],
   ['stripe',   /[rs]k_(?:live|test)_[A-Za-z0-9]{20,}/g],
   ['huggingface', /\bhf_[A-Za-z0-9]{30,}/g],
@@ -52,14 +54,18 @@ const SECRET_PATTERNS = [
   ['google',   /\bAIza[0-9A-Za-z_-]{35}\b/g],
   ['google-oauth', /GOCSPX-[A-Za-z0-9_-]{20,}/g],
 ];
-// placeholders SOLO claramente falsos (no '1234' ni '123': aparecen en claves reales -> falso negativo)
-const PLACEHOLDER = /aaaa|bbbb|cccc|xxxx|EXAMPLE|placeholder|your[_-]?(?:key|token|secret)|dummy|redacted|\.\.\./i;
+// placeholders SOLO claramente falsos. Endurecido (audit#5 #19): ya NO se descartan los tokens cortos
+// 'aaaa|bbbb|cccc|xxxx' porque una clave REAL puede contener por azar 4 chars repetidos -> falso negativo
+// (se descartaba la clave). Ahora: palabras-placeholder inequivocas (CI) + un run de 6+ chars identicos
+// (RUN6), que la alta entropia de una clave real practicamente nunca produce pero un placeholder de doc si.
+const PLACEHOLDER = /EXAMPLE|placeholder|your[_-]?(?:key|token|secret)|dummy|redacted|sample|fake|\.\.\./i;
+const RUN6 = /(.)\1{5,}/;  // 6+ del MISMO char seguido = artefacto de documentacion, no una clave real
 const redact = s => s.length <= 8 ? s[0] + '***' : s.slice(0, 4) + '***' + s.slice(-2);
 function scanText(text, file, hits, viaB64) {
   text.split('\n').forEach((line, i) => {
     for (const [kind, re] of SECRET_PATTERNS) {
       for (const m of line.matchAll(re)) {
-        if (/\*\*\*/.test(m[0]) || PLACEHOLDER.test(m[0])) continue;
+        if (/\*\*\*/.test(m[0]) || PLACEHOLDER.test(m[0]) || RUN6.test(m[0])) continue;
         hits.push({ file, line: i + 1, kind: viaB64 ? kind + '(base64)' : kind, sample: redact(m[0]) });
       }
     }
@@ -70,7 +76,8 @@ export function secretScan(dir) {
   const walk = d => {
     for (const f of readdirSync(d)) {
       const p = join(d, f);
-      const st = statSync(p);
+      const st = lstatSync(p);  // lstat: NO seguir symlinks (audit#5 G4: evita ciclos ELOOP y escanear fuera de MEM)
+      if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) { if (f !== '.git' && f !== 'node_modules') walk(p); continue; }
       if (!/\.(md|txt|json|js|mjs|sh|cmd|ya?ml|toml|pem|key|env|ini|conf)$/i.test(f) && !/^\.env/.test(f)) continue;
       const text = readFileSync(p, 'utf8');
@@ -160,16 +167,26 @@ function run() {
   try { const out = sh('node', [join(BRAIN, 'brain.mjs'), 'validate', '--mem', MEM]); report.steps.validate = out.trim(); log('validate:', out.trim()); }
   catch (e) { validateOk = false; report.steps.validate = 'ERRORES: ' + String(e.stdout || e.stderr || e.message || '').trim().slice(0, 300); log('validate FALLO:', report.steps.validate.slice(0, 160)); alert('validate en ROJO: ' + report.steps.validate.slice(0, 200)); }
 
-  // 2) secret-scan
-  const secrets = secretScan(MEM);
+  // 2) secret-scan — en try/catch (audit#5 #9): un walk que lance (symlink/permiso) NO debe tumbar el backup.
+  let secrets = [];
+  try { secrets = secretScan(MEM); }
+  catch (e) { log('secret-scan FALLO (no rompe el backup):', (e.message || '').slice(0, 80)); alert('secret-scan fallo (symlink/permiso?): ' + (e.message || '').slice(0, 100)); }
   report.steps.secretScan = secrets.length;
   if (secrets.length) { log(`secret-scan: ${secrets.length} hallazgo(s) — REVISAR`); secrets.forEach(h => log(`   ${h.kind} ${h.file}:${h.line} ${h.sample}`)); alert(`${secrets.length} secreto(s) en claro en la memoria`); }
   else log('secret-scan: 0 secretos en claro');
 
   // 2.5) GATE de arbol-limpio: con WIP de otra sesion NO mutamos (demote/render/commit); solo reportamos + respaldamos.
-  let treeClean = true;
-  try { treeClean = sh('git', ['-C', MEM, 'status', '--porcelain']).trim() === ''; } catch { treeClean = false; }
-  if (!treeClean) log('working tree SUCIO (WIP de otra sesion) — se omiten normalize/drain/demote/render/commit; corren validate+secret+backup');
+  let treeClean = true, porcelain = '';
+  let normalizedStems = [];  // stems que normalize dejo aplicados (para stagear explicito en el commit, audit#5 #11)
+  try { porcelain = sh('git', ['-C', MEM, 'status', '--porcelain', '-z']); treeClean = porcelain.trim() === ''; } catch { treeClean = false; }
+  if (!treeClean) {
+    // heuristica (audit#5 #13): si TODO lo dirty cae bajo digests/ o inbox/ (el scope del consolidador) puede ser
+    // una consolidacion ABORTADA (digest integrado sin commit), no WIP humano -> alerta especifica en vez de silencio.
+    const dpaths = porcelain.split('\0').map(l => l.slice(3)).filter(Boolean);
+    const looksOrphan = dpaths.length > 0 && dpaths.every(p => p.startsWith('digests/') || p.startsWith('inbox/'));
+    if (looksOrphan) alert('posible consolidacion ABORTADA: arbol sucio solo en digests/+inbox/ sin commit (revisar: commitear o revertir)');
+    log('working tree SUCIO' + (looksOrphan ? ' (posible consolidacion abortada)' : ' (WIP de otra sesion)') + ' — se omiten normalize/drain/demote/render/commit; corren validate+secret+backup');
+  }
 
   // 2.6) NORMALIZE AUTOMATICO (Fase 0): si validate fallo SOLO por nodos no-v3 y el arbol esta limpio, repararlos.
   //      Cierra el lazo de la memoria nativa sin intervencion humana. Nunca toca nodos que el humano edito.
@@ -182,15 +199,17 @@ function run() {
     try {
       const nout = sh('node', [join(BRAIN, 'brain.mjs'), 'normalize', '--mem', MEM]);
       log('normalize auto:', nout.trim().split('\n')[0]);
-      // nodos que normalize dejo dirty (lista exacta, antes de re-validar). -z: NUL-terminado, sin comillado
-      // (robusto ante nombres con espacios/UTF-8, fix Low audit#4); cada entrada es 'XY <path>\0'.
-      const touched = sh('git', ['-C', MEM, 'status', '--porcelain', '-z']).split('\0')
-        .map(l => l.slice(3)).filter(Boolean);
-      try { sh('node', [join(BRAIN, 'brain.mjs'), 'validate', '--mem', MEM]); validateOk = true; report.steps.normalized = true; log('validate OK tras normalize'); }
+      // stems que normalize DECLARO arreglar (parsea su salida "  - <stem> (...)"). Revertimos SOLO estos
+      // (interseccion con lo realmente dirty), NO todo el arbol (audit#5 #10: un `git checkout --` de todo lo
+      // dirty podia destruir el WIP TRACKED de una sesion interactiva que entrara en la ventana). -z = NUL, sin comillado.
+      const fixedStems = nout.split('\n').filter(l => /^\s*-\s/.test(l)).map(l => l.replace(/^\s*-\s+/, '').split(' ')[0]).filter(Boolean);
+      const touched = sh('git', ['-C', MEM, 'status', '--porcelain', '-z']).split('\0').map(l => l.slice(3)).filter(Boolean);
+      const toRevert = touched.filter(p => fixedStems.includes(basename(p, '.md')));
+      try { sh('node', [join(BRAIN, 'brain.mjs'), 'validate', '--mem', MEM]); validateOk = true; report.steps.normalized = true; normalizedStems = fixedStems; log('validate OK tras normalize'); }
       catch {
-        // re-validate ROJO: habia error(es) no-normalizable(s). Revertir lo tocado para dejar el arbol como estaba.
-        if (touched.length) { try { sh('git', ['-C', MEM, 'checkout', '--', ...touched]); report.steps.normalizeReverted = touched.length; log(`normalize REVERTIDO (${touched.length} nodo[s]): el re-validate seguia rojo por errores no-normalizables`); } catch (re) { log('WARN: revert de normalize fallo:', re.message.slice(0, 80)); alert('normalize dejo el arbol sucio y el revert FALLO (revisar manual)'); } }
-        else log('validate sigue en rojo tras normalize, pero normalize no toco nada (errores no-normalizables)');
+        // re-validate ROJO: habia error(es) no-normalizable(s). Revertir SOLO lo que normalize toco.
+        if (toRevert.length) { try { sh('git', ['-C', MEM, 'checkout', '--', ...toRevert]); report.steps.normalizeReverted = toRevert.length; log(`normalize REVERTIDO (${toRevert.length} nodo[s] que normalize toco): el re-validate seguia rojo por errores no-normalizables`); } catch (re) { log('WARN: revert de normalize fallo:', re.message.slice(0, 80)); alert('normalize dejo el arbol sucio y el revert FALLO (revisar manual)'); } }
+        else log('validate sigue rojo tras normalize, pero normalize no dejo nodos suyos que revertir (errores no-normalizables)');
         alert('validate en rojo tras normalize (errores no-normalizables; cambios de normalize revertidos)');
       }
     } catch (e) { log('normalize fallo:', e.message.slice(0, 80)); }
@@ -207,11 +226,12 @@ function run() {
     for (const f of readdirSync(MEM)) {
       if (!f.endsWith('.md') || f === 'MEMORY.md') continue;
       const full = join(MEM, f);
-      if (!statSync(full).isFile()) continue;
-      const raw = readFileSync(full, 'utf8');
-      const st = /^\s*status:\s*(\w+)/m.exec(raw);
-      const vf = /^\s*valid_from:\s*([\d-]+)/m.exec(raw);
-      if (st && st[1] === 'cerrado' && vf && daysSince(vf[1]) > DEMOTE_DAYS) {
+      if (!lstatSync(full).isFile()) continue;
+      // anclado al FRONTMATTER real (audit#5 G2): el regex ad-hoc anterior podia matchear 'status: cerrado'
+      // dentro del cuerpo/un bloque de codigo y archivar un nodo vigente por error.
+      const parsed = parseFrontmatter(readFileSync(full, 'utf8'));
+      const md = parsed && parsed.fm.metadata;
+      if (md && md.status === 'cerrado' && md.valid_from && daysSince(String(md.valid_from)) > DEMOTE_DAYS) {
         demoted.push(f);
         if (!DRY) { mkdirSync(join(MEM, 'archivo'), { recursive: true }); renameSync(full, join(MEM, 'archivo', f)); }
       }
@@ -238,12 +258,18 @@ function run() {
     let destOk = true;
     try {
       mkdirSync(dst, { recursive: true });
-      cpSync(MEM, join(dst, 'memory'), { recursive: true });
-      for (const f of ['brain.mjs', 'graph.mjs', 'maintain.mjs', 'consolidate.mjs', 'brain.config.mjs', 'SYSTEM-STATE.md'])
+      // filtro (audit#5 G11): inbox/ es transitorio + gitignored (punteros de sesion). El README promete que NO
+      // se respalda; antes el cpSync crudo lo copiaba igual. Lo excluimos para honrar el contrato de backup.
+      cpSync(MEM, join(dst, 'memory'), {
+        recursive: true,
+        filter: (s) => { const rel = s.slice(MEM.length).replace(/\\/g, '/').replace(/^\//, ''); return !(rel === 'inbox' || rel.startsWith('inbox/')); },
+      });
+      // lib.mjs es ahora nucleo (el parser vive ahi): sin el, brain.mjs/graph.mjs no corren -> entra al DR de codigo.
+      for (const f of ['brain.mjs', 'graph.mjs', 'maintain.mjs', 'consolidate.mjs', 'brain.config.mjs', 'lib.mjs', 'restore.mjs', 'install.mjs', 'SYSTEM-STATE.md'])
         if (existsSync(join(BRAIN, f))) cpSync(join(BRAIN, f), join(dst, 'claude-brain', f));
       if (existsSync(join(BRAIN, 'visor', 'index.html'))) cpSync(join(BRAIN, 'visor', 'index.html'), join(dst, 'claude-brain', 'visor', 'index.html'));
       report.steps.backup = dst; log('backup ->', dst);
-    } catch (e) { destOk = false; report.steps.backup = 'FALLO'; log('backup FALLO:', e.message.slice(0, 80)); alert(`backup omitido: destino ${BACKUP_DIR} no disponible`); }
+    } catch (e) { destOk = false; report.steps.backup = 'FALLO'; log('backup FALLO:', (e.message || '').slice(0, 80)); alert(`backup omitido (${e.code || 'error'}): ${(e.message || '').slice(0, 100)}`); }
     // 7b) DR de la episodica (audit#4): tarball rotado + alerta de obsolescencia. Va al BACKUP_DIR raiz
     //     (no al subdir -auto del dia) para que la rotacion cruce corridas y restore.mjs lo halle con --from <BACKUP_DIR>.
     if (destOk) backupEpisodic(BACKUP_DIR, report.ts);
@@ -259,15 +285,27 @@ function run() {
   report.steps.systemState = { nodes, digs, arch, n0, validateOk, treeClean };
 
   // 9) commit/push — solo si limpio (gate) + validate OK + hubo algun cambio del job (demote/normalize/drain).
-  //    add -A es SEGURO aqui: el gate de arbol-limpio garantiza que todo lo dirty lo produjo este job.
+  //    Staging EXPLICITO (audit#5 #11/D3): se re-verifica el arbol justo antes y solo se commitean paths del
+  //    propio job (MEMORY.md, archivo/, nodos demoted/normalized). Si aparece algo ajeno en la ventana, se aborta.
   const huboCambio = demoted.length || report.steps.normalized || report.steps.drained;
   if (!DRY && treeClean && validateOk && huboCambio) {
     try {
-      sh('git', ['-C', MEM, 'add', '-A']);
-      const msg = `maintain: ${demoted.length} demote${report.steps.normalized ? ' + normalize' : ''}${report.steps.drained ? ' + drain-inbox' : ''} + N0/grafo (${report.ts.slice(0, 10)})`;
-      sh('git', ['-C', MEM, '-c', 'user.name=brain-maintainer', '-c', 'user.email=brain@local', 'commit', '-q', '-m', msg]);
-      if (secrets.length) { report.steps.git = `commit local (push BLOQUEADO: ${secrets.length} secreto(s))`; alert(`push bloqueado por ${secrets.length} secretos`); }
-      else { try { sh('git', ['-C', MEM, 'push', '-q', 'origin', 'main']); report.steps.git = 'commit+push'; } catch { report.steps.git = 'commit (push fallo)'; } }
+      const now = sh('git', ['-C', MEM, 'status', '--porcelain', '-z']).split('\0').map(l => l.slice(3)).filter(Boolean);
+      const demotedStems = demoted.map(f => basename(f, '.md'));
+      const allowed = p => p === 'MEMORY.md' || p.startsWith('archivo/') || p.startsWith('inbox/')
+        || demotedStems.includes(basename(p, '.md')) || normalizedStems.includes(basename(p, '.md'));
+      const foreign = now.filter(p => !allowed(p));
+      if (!now.length) { report.steps.git = 'sin cambios netos en el arbol'; }
+      else if (foreign.length) {
+        report.steps.git = 'omitido (WIP ajeno en la ventana)';
+        alert('commit de maintain omitido: cambios inesperados en el arbol (' + foreign.slice(0, 5).join(', ') + ') — preservando posible WIP de otra sesion');
+      } else {
+        for (const p of now) sh('git', ['-C', MEM, 'add', '--', p]);  // stagea solo lo esperado (incluye borrados por demote)
+        const msg = `maintain: ${demoted.length} demote${report.steps.normalized ? ' + normalize' : ''}${report.steps.drained ? ' + drain-inbox' : ''} + N0/grafo (${report.ts.slice(0, 10)})`;
+        sh('git', ['-C', MEM, '-c', 'user.name=brain-maintainer', '-c', 'user.email=brain@local', 'commit', '-q', '-m', msg]);
+        if (secrets.length) { report.steps.git = `commit local (push BLOQUEADO: ${secrets.length} secreto(s))`; alert(`push bloqueado por ${secrets.length} secretos`); }
+        else { try { sh('git', ['-C', MEM, 'push', '-q', 'origin', 'main']); report.steps.git = 'commit+push'; } catch (pe) { report.steps.git = 'commit (push fallo)'; log('push fallo (commit local conservado):', (pe.message || '').slice(0, 60)); } }
+      }
       log('git:', report.steps.git);
     } catch (e) { log('git: fallo', e.message.slice(0, 60)); }
   } else log(`git: ${!treeClean ? 'omitido (tree sucio)' : !validateOk ? 'omitido (validate ROJO)' : huboCambio ? '(dry)' : 'sin cambios'}`);

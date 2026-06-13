@@ -9,7 +9,7 @@
 //      (archivos con el mismo nombre se sobrescriben; los demas quedan). Si el destino ya tiene datos, se avisa.
 // Salida: imprime "restauradas N de M" y sale con codigo 1 si alguna seccion fallo de verdad (no por diseno).
 import { existsSync, cpSync, mkdirSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolveMem, HOME } from './brain.config.mjs';
@@ -20,6 +20,7 @@ const DRY = args.includes('--dry-run');
 const FROM = flag('--from');
 const MEM = resolveMem(flag('--mem'));
 const DO_EP = args.includes('--episodic');
+const FORCE = args.includes('--force');   // requerido para sobreescribir un destino NO vacio (audit#5 #12)
 const EP_DEST = flag('--episodic-dest');  // override del destino de la episodica (default = el real)
 const log = (...a) => console.log(DRY ? '[dry]' : '[ok]', ...a);
 const tars = existsSync(FROM) ? readdirSync(FROM).filter(f => f.endsWith('.tar.gz')) : [];
@@ -28,9 +29,13 @@ if (!FROM || !existsSync(FROM)) { console.error('--from <backupDir> requerido y 
 
 // contadores de secciones: cuantas se intentaron (no omitidas por diseno) y cuantas fallaron de verdad.
 let attempted = 0, restored = 0, failed = 0;
-// avisa si el destino de un cpSync overlay ya tiene contenido (no es merge limpio: se sobrescribe encima).
-function warnIfPopulated(dst, label) {
-  try { if (existsSync(dst) && readdirSync(dst).length > 0) log(`AVISO: ${label} ya tiene datos en ${dst} — cpSync es overlay, no merge limpio (se sobrescribe encima)`); } catch { /* destino ilegible: seguir */ }
+// BLOQUEA si el destino de un cpSync overlay ya tiene contenido y NO se paso --force (audit#5 #12).
+// cpSync es overlay (sobrescribe homonimos sin borrar el resto): restaurar sobre un MEM con WIP/datos mas
+// nuevos pisaria en silencio. Lanza para que el caller lo cuente como fallo (en vez del aviso pasivo anterior).
+function blockIfPopulated(dst, label) {
+  let populated = false;
+  try { populated = existsSync(dst) && readdirSync(dst).length > 0; } catch { populated = false; }
+  if (populated && !FORCE) throw new Error(`destino ${label} ${dst} NO esta vacio; usa --force para sobreescribir (no piso datos sin permiso)`);
 }
 
 // extrae un tarball a un temp. Devuelve { tmp, sub } donde:
@@ -72,7 +77,7 @@ if (tars.some(t => /markdown-global/.test(t))) {
   else {
     try {
       const src = r.sub;                      // SIEMPRE el subdir memory/; un markdown-global valido lo trae al tope
-      log(`memory (tarball): -> ${MEM}`); warnIfPopulated(MEM, 'memory'); mkdirSync(MEM, { recursive: true }); cpSync(src, MEM, { recursive: true }); restored++;
+      log(`memory (tarball): -> ${MEM}`); blockIfPopulated(MEM, 'memory'); mkdirSync(MEM, { recursive: true }); cpSync(src, MEM, { recursive: true }); restored++;
     } catch (e) { log(`FALLO copiando memory: ${e.message.slice(0, 80)}`); failed++; }
     finally { rmSync(r.tmp, { recursive: true, force: true }); }  // SIEMPRE limpia solo su propio tmp
   }
@@ -80,13 +85,15 @@ if (tars.some(t => /markdown-global/.test(t))) {
   // dir descomprimido
   attempted++;
   const src = existsSync(join(FROM, 'memory')) ? join(FROM, 'memory') : FROM;
+  if (src === FROM) log('AVISO: el backup no trae subdir memory/; se copiaria FROM completo (puede incluir .git u otros) — verifica que --from apunte a un backup valido (audit#5 G8)');
   log(`memory (dir): ${src} -> ${MEM}`);
-  if (!DRY) { try { warnIfPopulated(MEM, 'memory'); mkdirSync(MEM, { recursive: true }); cpSync(src, MEM, { recursive: true }); restored++; } catch (e) { log(`FALLO copiando memory: ${e.message.slice(0, 80)}`); failed++; } }
+  if (!DRY) { try { blockIfPopulated(MEM, 'memory'); mkdirSync(MEM, { recursive: true }); cpSync(src, MEM, { recursive: true }); restored++; } catch (e) { log(`FALLO copiando memory: ${e.message.slice(0, 80)}`); failed++; } }
   else restored++;
 } else log('WARN: no encontre memory/ ni markdown-global.tar.gz en el backup — nada que restaurar para la memoria');
 
 // --- 2) EPISODICA (opt-in por tamano ~1.5GB) ---
 if (DO_EP) {
+  if (EP_DEST && !isAbsolute(EP_DEST)) { console.error('--episodic-dest debe ser una ruta ABSOLUTA (audit#5 G8: evita escribir 1.5GB en un lugar relativo inesperado)'); process.exit(2); }
   const dstEp = EP_DEST || join(HOME, '.config', 'superpowers');  // --episodic-dest la dirige a otro dir (ensayo en temp)
   if (tars.some(t => /episodic-superpowers/.test(t))) {
     attempted++;
@@ -100,14 +107,14 @@ if (DO_EP) {
     else {
       try {
         const src = r.sub;                    // SIEMPRE el subdir superpowers/; un episodic-superpowers valido lo trae al tope
-        log(`episodica (tarball): -> ${dstEp}`); warnIfPopulated(dstEp, 'episodica'); mkdirSync(dstEp, { recursive: true }); cpSync(src, dstEp, { recursive: true }); restored++;
+        log(`episodica (tarball): -> ${dstEp}`); blockIfPopulated(dstEp, 'episodica'); mkdirSync(dstEp, { recursive: true }); cpSync(src, dstEp, { recursive: true }); restored++;
       } catch (e) { log(`FALLO copiando episodica: ${e.message.slice(0, 80)}`); failed++; }
       finally { rmSync(r.tmp, { recursive: true, force: true }); }  // SIEMPRE limpia solo su propio tmp
     }
   } else if (existsSync(join(FROM, 'superpowers'))) {
     attempted++;
     log(`episodica (dir): -> ${dstEp}`);
-    if (!DRY) { try { warnIfPopulated(dstEp, 'episodica'); mkdirSync(dstEp, { recursive: true }); cpSync(join(FROM, 'superpowers'), dstEp, { recursive: true }); restored++; } catch (e) { log(`FALLO copiando episodica: ${e.message.slice(0, 80)}`); failed++; } }
+    if (!DRY) { try { blockIfPopulated(dstEp, 'episodica'); mkdirSync(dstEp, { recursive: true }); cpSync(join(FROM, 'superpowers'), dstEp, { recursive: true }); restored++; } catch (e) { log(`FALLO copiando episodica: ${e.message.slice(0, 80)}`); failed++; } }
     else restored++;
   } else log('WARN: --episodic pedido pero no hay superpowers/ ni episodic-superpowers.tar.gz');
 } else log('episodica: omitida (pasa --episodic para restaurarla)');

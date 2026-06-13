@@ -8,9 +8,13 @@ set +e
 CFG="$HOME/.claude/brain.json"
 BRAIN="$HOME/projects/claude-brain"
 MEM_DIR=""
-[ -f "$CFG" ] && MEM_DIR=$(grep -o '"memDir"[^,}]*' "$CFG" | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+# [[:space:]] en vez de \s (audit#5 #21): \s no es clase en BSD sed (macOS) -> ahi no matcheaba y devolvia la linea entera.
+[ -f "$CFG" ] && MEM_DIR=$(grep -o '"memDir"[^,}]*' "$CFG" | sed -E 's/.*"memDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
 if [ -z "$MEM_DIR" ]; then
-  SLUG=$(echo "$HOME" | sed -E 's#[^a-zA-Z0-9]#-#g')
+  # slug del path Windows NATIVO (audit#5 #22): usar USERPROFILE (C:\Users\x) y no $HOME, que en Git Bash es
+  # /c/Users/x (MSYS) y produce el slug equivocado (-c-Users-x). En macOS/Linux USERPROFILE no existe -> cae a $HOME.
+  RAW="${USERPROFILE:-$HOME}"
+  SLUG=$(echo "$RAW" | sed -E 's#[^a-zA-Z0-9]#-#g')
   MEM_DIR="$HOME/.claude/projects/$SLUG/memory"
 fi
 SOFT=7168; HARD=25000
