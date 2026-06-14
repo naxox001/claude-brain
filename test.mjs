@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, cpSync, existsSync, readdirSync, utimesSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { secretScan } from './maintain.mjs';
 import { acquireLock, releaseLock, BRAIN_DIR } from './brain.config.mjs';
@@ -555,4 +555,73 @@ test('maintain: poda inbox/.procesadas/ >30d, deja las recientes (Pieza 2)', () 
   assert.ok(!existsSync(join(proc, 'vieja.md')), 'la nota consumida >30d debe podarse');
   assert.ok(existsSync(join(proc, 'reciente.md')), 'la reciente debe quedarse');
   rmSync(d, { recursive: true, force: true });
+});
+
+// === REALTIME Pieza 1 (consolidador en git-worktree) — integracion con LLM stubeado ===
+
+test('Pieza 1 worktree: aplica digest sin pisar WIP humano, difiere en colision, crea nodo nuevo, no-op limpio', () => {
+  // driver: importa runConsolidation y reemplaza el LLM por un stub que edita el WT. Corre en proceso hijo
+  // con BRAIN_MEM=mem (modulo fresco), asi runConsolidation opera sobre el MEM temporal del escenario.
+  const consUrl = pathToFileURL(join(HERE, 'consolidate.mjs')).href;
+  const nodeV3 = '---\nname: project_nuevo\ndescription: nuevo\nmetadata:\n  type: project\n  domain: web\n  status: vigente\n  valid_from: 2026-01-01\n  importance: 3\n---\ncuerpo\n';
+  const drvSrc = [
+    `import { runConsolidation } from ${JSON.stringify(consUrl)};`,
+    `import { writeFileSync, readFileSync } from 'node:fs';`,
+    `import { join } from 'node:path';`,
+    `const scen = process.argv[2], notes = process.argv[3].split(',');`,
+    `runConsolidation(notes, (WT) => {`,
+    `  if (scen === 'noop') return;`,
+    `  const wd = join(WT, 'digests', 'web.md');`,
+    `  writeFileSync(wd, readFileSync(wd, 'utf8') + '\\n- integrada ' + scen + '\\n');`,
+    `  if (scen === 'newnode') writeFileSync(join(WT, 'project_nuevo.md'), ${JSON.stringify(nodeV3)});`,
+    `});`,
+  ].join('\n');
+  function setupMem() {
+    const d = mkdtempSync(join(tmpdir(), 'brain-wt-'));
+    const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
+    writeFileSync(join(mem, '.gitignore'), 'inbox/_*.md\ninbox/.procesadas/\n');
+    writeFileSync(join(mem, 'digests', 'web.md'), '---\nname: digest-web\ndescription: d\nmetadata: { type: reference, domain: web, status: vigente, valid_from: 2026-01-01, digest: true }\n---\n# D\n## Vigente ahora\nlinea base\n');
+    const g = (...a) => execFileSync('git', ['-C', mem, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    g('init', '-q'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't'); g('add', '-A'); g('commit', '-q', '-m', 'i');
+    mkdirSync(join(mem, 'inbox'), { recursive: true });
+    writeFileSync(join(mem, 'inbox', '_note_x.md'), 'nota durable');
+    writeFileSync(join(d, 'driver.mjs'), drvSrc);
+    return { d, mem, g, drv: join(d, 'driver.mjs') };
+  }
+  const web = mem => readFileSync(join(mem, 'digests', 'web.md'), 'utf8');
+
+  // 1) NORMAL (sin WIP): aplica la integracion al digest del MEM + commitea + drena la nota
+  let s = setupMem();
+  run2([s.drv, 'normal', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.match(web(s.mem), /integrada normal/, 'aplica la integracion del LLM al digest del MEM');
+  assert.match(s.g('log', '--oneline', '-1'), /consolidate/, 'commitea la consolidacion');
+  assert.ok(existsSync(join(s.mem, 'inbox', '.procesadas', '_note_x.md')) && !existsSync(join(s.mem, 'inbox', '_note_x.md')), 'drena la nota a .procesadas/');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // 2) COLISION (humano edito el MISMO digest, sin commitear): difiere TODO, NO pisa el WIP, nota en cola
+  s = setupMem();
+  writeFileSync(join(s.mem, 'digests', 'web.md'), web(s.mem) + '\nWIP HUMANO sin commitear\n');
+  run2([s.drv, 'conflict', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.match(web(s.mem), /WIP HUMANO/, 'preserva el WIP humano del digest');
+  assert.ok(!/integrada conflict/.test(web(s.mem)), 'NO aplica la integracion (diferida por colision)');
+  assert.ok(existsSync(join(s.mem, 'inbox', '_note_x.md')), 'la nota sigue en cola (diferida)');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // 3) NODO NUEVO: el LLM crea un nodo v3 -> se aplica al MEM
+  s = setupMem();
+  run2([s.drv, 'newnode', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.ok(existsSync(join(s.mem, 'project_nuevo.md')), 'aplica el nodo nuevo del LLM al MEM');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // 4) NO-OP (el LLM no integro nada): no commitea, drena la nota (consumida)
+  s = setupMem();
+  const head0 = s.g('rev-parse', 'HEAD').trim();
+  run2([s.drv, 'noop', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.equal(s.g('rev-parse', 'HEAD').trim(), head0, 'no-op: no commitea');
+  assert.ok(existsSync(join(s.mem, 'inbox', '.procesadas', '_note_x.md')), 'no-op: drena la nota');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // cleanup de derivados que el flujo regenero en el repo de codigo (gitignored, regenerables)
+  try { rmSync(join(HERE, 'visor', 'graph.json'), { force: true }); } catch {}
+  try { rmSync(join(HERE, 'derived'), { recursive: true, force: true }); } catch {}
 });

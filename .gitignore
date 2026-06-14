@@ -5,6 +5,7 @@ derived/
 visor/graph.json
 visor/.playwright-mcp/
 last-maintain-report.json
+last-consolidate.json
 CONSOLIDATOR-ALERT.txt
 .tmptest/
 .rehearsal/
