@@ -539,6 +539,9 @@ test('refresh-graph: regenera el grafo derivado contra --out (Pieza 3-A)', () =>
   assert.equal(r.code, 0, r.out);
   assert.ok(existsSync(join(out, 'visor', 'graph.json')), 'genera visor/graph.json');
   assert.ok(existsSync(join(out, 'derived', 'graph.db')), 'genera derived/graph.db');
+  // guard anti-clobber (audit-realtime #4): --mem explicito SIN --out debe abortar (no pisar los derivados reales)
+  assert.equal(run(['brain.mjs', 'refresh-graph', '--mem', mem]).code, 2, '--mem sin --out debe abortar');
+  assert.equal(run(['brain.mjs', 'refresh-graph', '--mem', mem, '--out']).code, 2, '--out sin valor tambien aborta');
   rmSync(d, { recursive: true, force: true });
 });
 
@@ -619,6 +622,22 @@ test('Pieza 1 worktree: aplica digest sin pisar WIP humano, difiere en colision,
   run2([s.drv, 'noop', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
   assert.equal(s.g('rev-parse', 'HEAD').trim(), head0, 'no-op: no commitea');
   assert.ok(existsSync(join(s.mem, 'inbox', '.procesadas', '_note_x.md')), 'no-op: drena la nota');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // 5) WIP HUMANO PRE-STAGEADO (no-target): NO debe entrar al commit del consolidador; queda staged (audit-realtime #1)
+  s = setupMem();
+  writeFileSync(join(s.mem, 'feedback_humano.md'), 'nodo humano en progreso, no commiteado');
+  s.g('add', 'feedback_humano.md');  // el humano lo PRE-STAGEA
+  run2([s.drv, 'normal', '_note_x.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.ok(!/feedback_humano/.test(s.g('show', '--stat', '--oneline', 'HEAD')), 'el commit del consolidador NO debe absorber el WIP humano pre-stageado');
+  assert.match(s.g('status', '--porcelain'), /^A {2}feedback_humano\.md/m, 'el WIP humano pre-stageado sigue staged (no commiteado)');
+  rmSync(s.d, { recursive: true, force: true });
+
+  // 6) STALL: una nota con texto tipo-secreto NO debe stallear la consolidacion (secretScan excluye inbox) (audit-realtime #12)
+  s = setupMem();
+  writeFileSync(join(s.mem, 'inbox', '_note_secreta.md'), 'recuerda esta clave: sk-ant-api03-' + 'Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St');
+  run2([s.drv, 'normal', '_note_x.md,_note_secreta.md'], { ...process.env, BRAIN_MEM: s.mem });
+  assert.match(web(s.mem), /integrada normal/, 'una nota con texto tipo-secreto NO debe stallear la consolidacion (inbox excluido del secret-scan del WT)');
   rmSync(s.d, { recursive: true, force: true });
 
   // cleanup de derivados que el flujo regenero en el repo de codigo (gitignored, regenerables)

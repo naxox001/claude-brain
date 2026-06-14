@@ -12,20 +12,20 @@
 //  - Cada corrida exitosa = 1 commit git (auditable y revertible con git revert).
 // Uso: node consolidate.mjs [--dry-run]
 import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, cpSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, acquireLock, releaseLock } from './brain.config.mjs';
+import { resolveMem, BRAIN_DIR, acquireLock, releaseLock } from './brain.config.mjs';
 import { writeAtomic } from './lib.mjs';
 import { secretScan } from './maintain.mjs';
 
 const DRY = process.argv.includes('--dry-run');
-const HOME = CFG_HOME;
 const MEM = resolveMem(null);
 const BRAIN = BRAIN_DIR;
 const INBOX = join(MEM, 'inbox');
 const log = (...a) => console.log(DRY ? '[dry]' : '[run]', ...a);
 const sh = (c, a, o = {}) => execFileSync(c, a, { encoding: 'utf8', ...o });
+const hashStr = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(16); };  // hash de contenido (sentinela)
 
 function buildPrompt(digests, inboxPath = INBOX) {
   return [
@@ -68,7 +68,9 @@ function digestsOf(dir) {
 function setupWorktree(head) {
   const WT = join(tmpdir(), `brain-wt-${process.pid}-${Date.now()}`);
   sh('git', ['-C', MEM, 'worktree', 'add', '--detach', WT, head], { stdio: 'ignore' });
-  try { if (existsSync(INBOX)) cpSync(INBOX, join(WT, 'inbox'), { recursive: true }); } catch {}  // las notas (gitignored) no vienen en el checkout
+  // copiar las notas (gitignored, no vienen en el checkout) EXCLUYENDO _entrante_ (staging aun no promovido): si
+  // el LLM las viera podria integrar una nota que NO esta en la lista de drenado -> doble-integracion (audit-realtime #8/#11).
+  try { if (existsSync(INBOX)) cpSync(INBOX, join(WT, 'inbox'), { recursive: true, filter: s => !basename(s).startsWith('_entrante_') }); } catch {}
   return WT;
 }
 function teardownWorktree(WT) {
@@ -93,13 +95,21 @@ function recoverFromSentinel() {
   let head; try { head = sh('git', ['-C', MEM, 'rev-parse', 'HEAD']).trim(); } catch { clearSentinel(); return; }
   if (!s || s.head !== head) { clearSentinel(); return; }  // HEAD avanzo o sentinela ajeno: no aplica
   const bdir = join(BRAIN, 'rollback-backups', 'sentinel-' + Date.now());
-  for (const p of (s.paths || [])) {
-    try { const memP = join(MEM, p); if (existsSync(memP)) { mkdirSync(dirname(join(bdir, p)), { recursive: true }); cpSync(memP, join(bdir, p)); } } catch {}  // respaldo
+  let preserved = 0;
+  for (const e of (s.paths || [])) {
+    const p = typeof e === 'string' ? e : e.p, hash = typeof e === 'string' ? null : e.hash;
+    const memP = join(MEM, p);
+    let cur = null; try { cur = readFileSync(memP, 'utf8'); } catch {}
+    try { if (cur !== null) { mkdirSync(dirname(join(bdir, p)), { recursive: true }); cpSync(memP, join(bdir, p)); } } catch {}  // respaldo SIEMPRE
+    // si el contenido actual NO es lo que escribio la corrida crasheada (hash distinto), un HUMANO lo edito encima
+    // -> NO revertir (preservar su WIP); el respaldo ya quedo. Si coincide (o desaparecio), revertir es seguro (audit-realtime #3/#20).
+    if (hash && cur !== null && hashStr(cur) !== hash) { preserved++; continue; }
     try { sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'checkout', '--', p]); }      // revierte tracked a HEAD
-    catch { try { rmSync(join(MEM, p), { force: true }); } catch {} }                        // nodo nuevo (untracked): borrar
+    catch { try { rmSync(memP, { force: true }); } catch {} }                                // nodo nuevo (untracked): borrar
   }
   clearSentinel();
-  log('recuperacion: revertidos los cambios de una consolidacion crasheada previa (respaldo en ' + bdir + ')');
+  if (preserved) alert(`recuperacion: ${preserved} path(s) con edicion humana posterior al crash NO se revirtieron (preservados; respaldo en ${bdir})`);
+  log('recuperacion: cambios de una consolidacion crasheada previa procesados (respaldo en ' + bdir + ')');
 }
 
 // fusiona los cambios del WT (commit C) de vuelta al MEM. APLICAR-DIRECTO-O-DIFERIR (all-or-nothing): si ALGUN
@@ -114,15 +124,11 @@ function mergeBack(head, WT) {
     try { dirty = sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'status', '--porcelain', '--', p]).trim() !== ''; } catch {}
     if (dirty) return { applied: [], conflict: p };
   }
-  writeSentinel(head, changed);  // ANTES de escribir, por si crashea
+  const entries = [];
+  for (const p of changed) { const theirs = join(WT, p); if (existsSync(theirs)) entries.push({ p, content: readFileSync(theirs, 'utf8') }); }
+  writeSentinel(head, entries.map(e => ({ p: e.p, hash: hashStr(e.content) })));  // ANTES de escribir: {p, hash} para distinguir luego nuestro write de una edicion humana
   const applied = [];
-  for (const p of changed) {
-    const theirs = join(WT, p);
-    if (!existsSync(theirs)) continue;
-    const memP = join(MEM, p); mkdirSync(dirname(memP), { recursive: true });
-    writeAtomic(memP, readFileSync(theirs, 'utf8'));
-    applied.push(p);
-  }
+  for (const e of entries) { const memP = join(MEM, e.p); mkdirSync(dirname(memP), { recursive: true }); writeAtomic(memP, e.content); applied.push(e.p); }
   return { applied, conflict: null };
 }
 
@@ -172,7 +178,9 @@ export function runConsolidation(notes, llmStep) {
     catch { log('VALIDATE FALLO en el worktree — se descarta'); alert('consolidador rompio validate (en worktree); descartado'); return; }
     const viol = diffViolations(head, [], WT);
     if (viol.length) { log('GATE DIFERENCIAL (worktree) — se descarta:'); viol.slice(0, 3).forEach(v => log('   ' + v)); alert('consolidador violo el contrato (worktree); descartado: ' + viol.slice(0, 3).join(' | ')); return; }
-    const secrets = secretScan(WT);
+    // secretScan EXCLUYE inbox/ (audit-realtime #12): las notas crudas son INSUMO del usuario, no algo que el LLM
+    // escribio. Sin esto, una nota con texto tipo-secreto descartaba la consolidacion en CADA ciclo -> stall permanente.
+    const secrets = secretScan(WT, ['inbox']);
     if (secrets.length) { log(`SECRETOS en el worktree (${secrets.length}) — se descarta`); secrets.slice(0, 3).forEach(h => log(`   ${h.kind} ${h.file}:${h.line} ${h.sample}`)); alert(`consolidador integro ${secrets.length} secreto(s) (worktree); descartado`); return; }
 
     // 3) commit en el WT (HEAD comparable). add -A es seguro: el WT esta AISLADO, sin WIP humano.
@@ -196,17 +204,26 @@ export function runConsolidation(notes, llmStep) {
       sh('node', [join(BRAIN, 'graph.mjs'), 'export-3d', '--mem', MEM]);
       const stage = [...applied, 'MEMORY.md'];
       if (existsSync(join(MEM, 'archivo', 'CATALOGO.md'))) stage.push('archivo/CATALOGO.md');
-      for (const p of stage) { try { sh('git', ['-C', MEM, 'add', '--', p]); } catch {} }  // NUNCA add -A (absorberia WIP humano)
-      sh('git', ['-C', MEM, '-c', 'user.name=brain-consolidator', '-c', 'user.email=brain@local', 'commit', '-q', '-m', `consolidate: ${notes.length} nota(s) integradas (${new Date().toISOString().slice(0, 10)})`]);
+      // stagear SOLO los paths del consolidador (el add tracked-iza los untracked: nodos nuevos, CATALOGO) y COMMIT por
+      // PATHSPEC EXPLICITO: 'commit -- <paths>' persiste SOLO esos e IGNORA cualquier WIP humano PRE-STAGEADO en el index
+      // (verificado empiricamente: un nodo humano pre-stageado queda staged y NO entra al commit). Nunca add -A ni commit
+      // sin pathspec (eso absorberia el WIP ajeno) (audit-realtime #1).
+      for (const p of stage) { try { sh('git', ['-C', MEM, 'add', '--', p]); } catch {} }
+      sh('git', ['-C', MEM, '-c', 'user.name=brain-consolidator', '-c', 'user.email=brain@local', 'commit', '-q', '-m', `consolidate: ${notes.length} nota(s) integradas (${new Date().toISOString().slice(0, 10)})`, '--', ...stage]);
     } catch (e) {
-      log('FALLO regenerando/commiteando tras el merge — revirtiendo lo aplicado (notas NO drenadas, siguen en cola):', (e.message || '').slice(0, 70));
-      for (const p of applied) { try { sh('git', ['-C', MEM, 'checkout', '--', p]); } catch { try { rmSync(join(MEM, p), { force: true }); } catch {} } }
-      clearSentinel(); alert('consolidador: fallo tras el merge; revertido; notas en cola'); return;
+      log('FALLO regenerando/commiteando tras el merge — revirtiendo aplicados + derivados (notas NO drenadas, en cola):', (e.message || '').slice(0, 70));
+      for (const p of [...applied, 'MEMORY.md', 'archivo/CATALOGO.md']) { try { sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'checkout', '--', p]); } catch { try { rmSync(join(MEM, p), { force: true }); } catch {} } }
+      clearSentinel(); alert('consolidador: fallo tras el merge; revertido (digests+derivados); notas en cola'); return;
     }
     clearSentinel();
     drainReal(notes);  // recien tras commit OK: si crashea entre commit y aca, las notas se re-procesan (el LLM deduplica)
     try { sh('git', ['-C', MEM, 'push', '-q', 'origin', 'main']); log('push OK'); } catch (pe) { log('push fallo (commit local conservado):', (pe.message || '').slice(0, 50)); }
     log(`consolidacion OK: ${applied.length} archivo(s) aplicado(s), ${notes.length} nota(s) integradas`);
+  } catch (e) {
+    // fallo INESPERADO (git worktree add, commit del WT, re-parse HEAD, etc.) antes de un return-con-alert: sin
+    // este catch la excepcion cruda crasheaba el job SIN escribir CONSOLIDATOR-ALERT (audit-realtime #6).
+    log('consolidador: fallo inesperado (git/worktree):', (e.message || '').slice(0, 80));
+    alert('consolidador: fallo inesperado (' + (e.message || '').slice(0, 100) + ')');
   } finally { teardownWorktree(WT); }
 }
 

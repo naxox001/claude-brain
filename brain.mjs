@@ -342,7 +342,11 @@ function note() {
 // correr a mano tras editar nodos para que el visor/query queden frescos sin esperar a un job. Best-effort.
 function refreshGraph() {
   const outIdx = args.indexOf('--out');  // forward --out si se da (default = BRAIN_DIR, donde el visor lee)
-  const extraOut = outIdx >= 0 && args[outIdx + 1] ? ['--out', args[outIdx + 1]] : [];
+  const hasOut = outIdx >= 0 && args[outIdx + 1] && !args[outIdx + 1].startsWith('--');
+  // con --mem explicito (otra memoria) SIN --out con ruta valida, abortar: regenerar contra otra memoria escribiendo
+  // en BRAIN_DIR CLOBBEREARIA los derivados REALES (visor/graph.json, derived/graph.db) que el visor lee (audit-realtime #4).
+  if (memIdx >= 0 && !hasOut) { console.error('refresh-graph: con --mem explicito requiere --out con una ruta (para no pisar los derivados reales)'); process.exit(2); }
+  const extraOut = hasOut ? ['--out', args[outIdx + 1]] : [];
   try {
     execFileSync(process.execPath, [join(BRAIN_DIR, 'graph.mjs'), 'build', '--mem', MEM, ...extraOut], { stdio: 'ignore' });
     execFileSync(process.execPath, [join(BRAIN_DIR, 'graph.mjs'), 'export-3d', '--mem', MEM, ...extraOut], { stdio: 'ignore' });

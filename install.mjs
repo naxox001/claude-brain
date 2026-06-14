@@ -89,7 +89,7 @@ if (!existsSync(MEM)) {
   // gitignored (si no, ensucian el arbol y disparan el gate). Aseguramos los patrones, idempotente (solo si faltan).
   if (!DRY) {
     const giPath = join(MEM, '.gitignore');
-    const want = ['inbox/_*.md', 'inbox/.procesadas/'];
+    const want = ['inbox/_*.md', 'inbox/.procesadas/', 'inbox/*.tmp'];  // *.tmp: el temporal de writeAtomic en note() (audit-realtime #13)
     const cur = existsSync(giPath) ? readFileSync(giPath, 'utf8') : '';
     const have = cur.split('\n').map(s => s.trim());
     const missing = want.filter(w => !have.includes(w));

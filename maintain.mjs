@@ -6,6 +6,7 @@
 // Uso: node maintain.mjs [--dry-run] [--mem <dir>]
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, lstatSync, renameSync, mkdirSync, cpSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, resolveBackupDir, acquireLock, releaseLock } from './brain.config.mjs';
 import { parseFrontmatter } from './lib.mjs';
@@ -72,14 +73,16 @@ function scanText(text, file, hits, viaB64) {
     }
   });
 }
-export function secretScan(dir) {
+export function secretScan(dir, skip = []) {
   const hits = [];
   const walk = d => {
     for (const f of readdirSync(d)) {
       const p = join(d, f);
       const st = lstatSync(p);  // lstat: NO seguir symlinks (audit#5 G4: evita ciclos ELOOP y escanear fuera de MEM)
       if (st.isSymbolicLink()) continue;
-      if (st.isDirectory()) { if (f !== '.git' && f !== 'node_modules') walk(p); continue; }
+      // skip permite excluir dirs (audit-realtime: el consolidador pasa ['inbox'] para NO escanear las notas crudas
+      // del usuario — son INSUMO, no algo que el LLM escribio; un texto tipo-secreto en una nota stalleaba el gate cada ciclo).
+      if (st.isDirectory()) { if (f !== '.git' && f !== 'node_modules' && !skip.includes(f)) walk(p); continue; }
       if (!/\.(md|txt|json|js|mjs|sh|cmd|ya?ml|toml|pem|key|env|ini|conf)$/i.test(f) && !/^\.env/.test(f)) continue;
       const text = readFileSync(p, 'utf8');
       const file = p.replace(dir, '.');  // relativo a la raiz escaneada (dir), no a la const MEM (habilita escanear un worktree, Fase 0)
@@ -233,6 +236,21 @@ function run() {
       }
       if (podadas) { log(`poda inbox/.procesadas/: ${podadas} nota(s) consumida(s) >30d`); report.steps.podaProcesadas = podadas; }
     }
+  }
+
+  // 2.9) PODA de worktrees del consolidador (Pieza 1 realtime / audit-realtime): 'git worktree prune' limpia las
+  //      entradas admin stale en .git/worktrees; ademas barremos los dirs brain-wt-* de tmpdir >1 dia (huerfanos
+  //      de una corrida que murio entre worktree-add y teardown). Asi no se acumulan sin tope.
+  if (!DRY) {
+    try { sh('git', ['-C', MEM, 'worktree', 'prune']); } catch {}
+    try {
+      const tmp = tmpdir();
+      for (const f of readdirSync(tmp)) {
+        if (!f.startsWith('brain-wt-')) continue;
+        const fp = join(tmp, f);
+        try { if (lstatSync(fp).isDirectory() && (Date.now() - statSync(fp).mtimeMs) > 86400000) { rmSync(fp, { recursive: true, force: true }); log('worktree huerfano barrido:', f); } } catch {}
+      }
+    } catch {}
   }
 
   // 3) auto-demote cerrados >60d (solo si limpio)
