@@ -31,11 +31,12 @@ function buildPrompt(digests, inboxPath = INBOX) {
   return [
     'Eres el consolidador nocturno del cerebro de memoria (sueno REM). Espanol neutro chileno, nunca voseo.',
     `Hay notas crudas en ${inboxPath}. Para cada una: decide a que dominio pertenece (digests disponibles: ${digests.join(', ')}),`,
-    'integra su contenido al digest de ese dominio en memory/digests/<dominio>.md (seccion adecuada: Vigente ahora / Pendientes / Detalle), deduplicando.',
+    // Rutas RELATIVAS al cwd (=WT, la raiz de la capa de memoria); no hay subdir 'memory/' aqui (fix audit round-3).
+    'integra su contenido al digest de ese dominio en digests/<dominio>.md (seccion adecuada: Vigente ahora / Pendientes / Detalle), deduplicando.',
     'Si una nota es un PUNTERO DE SESION (_session_*.md con un transcript path): lee ese transcript y extrae SOLO memorias DURABLES (decisiones, lecciones reutilizables, hechos nuevos, cambios de estado de proyecto); descarta lo efimero/conversacional. Si no hay nada durable, no crees nada.',
     'Si una nota es _note_*.md (captura intra-sesion): YA trae memoria durable curada — integrala directo al digest del dominio que corresponda, SIN abrir ningun transcript.',
-    'Si una nota amerita un nodo propio, crea memory/<prefijo>_<slug>.md con frontmatter v3 (name==filename, domain, status, valid_from, importance). Usa node brain.mjs add si dudas del formato.',
-    'REGLAS DURAS: NO edites MEMORY.md (es generado). NO borres ni reescribas cuerpos de nodos existentes. NO vacies ni recortes drasticamente un digest. NO toques nada fuera de memory/digests/ y memory/.',
+    'Si una nota amerita un nodo propio, crea <prefijo>_<slug>.md en la raiz con frontmatter v3 (name==filename, domain, status, valid_from, importance). Usa node brain.mjs add si dudas del formato.',
+    'REGLAS DURAS: NO edites MEMORY.md (es generado). NO borres ni reescribas cuerpos de nodos existentes. NO vacies ni recortes drasticamente un digest. NO toques nada fuera de digests/ y la raiz del repo (tu cwd).',
     'Al terminar, mueve cada nota procesada de inbox/ a inbox/.procesadas/ (crea el dir). No borres las notas.',
     'Se conservador: ante la duda, deja la nota en inbox/ sin tocar y registra por que.',
   ].join(' ');
