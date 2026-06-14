@@ -82,7 +82,7 @@ export function secretScan(dir) {
       if (st.isDirectory()) { if (f !== '.git' && f !== 'node_modules') walk(p); continue; }
       if (!/\.(md|txt|json|js|mjs|sh|cmd|ya?ml|toml|pem|key|env|ini|conf)$/i.test(f) && !/^\.env/.test(f)) continue;
       const text = readFileSync(p, 'utf8');
-      const file = p.replace(MEM, '.');
+      const file = p.replace(dir, '.');  // relativo a la raiz escaneada (dir), no a la const MEM (habilita escanear un worktree, Fase 0)
       scanText(text, file, hits, false);
       // heuristica base64 (audit#3): decodifica blobs >=40 chars y re-escanea (secretos ofuscados)
       for (const m of text.matchAll(/[A-Za-z0-9+/]{40,}={0,2}/g)) {

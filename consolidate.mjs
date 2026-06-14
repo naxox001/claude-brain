@@ -150,7 +150,7 @@ function runConsolidation(notes, prompt) {
 //   - 'git diff --name-status HEAD' -> cambios sobre archivos TRACKED (D/M/R).
 //   - 'git ls-files --others --exclude-standard' menos untrackedBefore -> archivos NUEVOS del LLM (A).
 // Un .md nuevo en raiz sin frontmatter v3 valido tambien es violacion.
-export function diffViolations(head, untrackedBefore) {
+export function diffViolations(head, untrackedBefore, dir = MEM) {
   const viol = [];
   const classifyPath = (p) => {
     const inInbox = p.startsWith('inbox/');
@@ -161,7 +161,7 @@ export function diffViolations(head, untrackedBefore) {
   };
   // 1) cambios sobre archivos tracked. core.quotepath=false (audit#5 #16): sin el, un path no-ASCII sale
   //    quoteado ("project_cami\303\263n.md") y classifyPath lo clasifica mal -> rollback espurio.
-  const out = sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'diff', '--name-status', head]);
+  const out = sh('git', ['-C', dir, '-c', 'core.quotepath=false', 'diff', '--name-status', head]);
   for (const line of out.split('\n')) {
     if (!line.trim()) continue;
     const [st, ...rest] = line.split('\t');
@@ -173,8 +173,8 @@ export function diffViolations(head, untrackedBefore) {
       // editar un digest esta PERMITIDO; VACIARLO o recortarlo drasticamente NO (audit#5 #14): es perdida
       // de datos dentro de un archivo permitido que validate no detecta. Comparamos magnitud vs HEAD.
       try {
-        const oldTxt = sh('git', ['-C', MEM, 'show', `${head}:${p}`]);
-        const newTxt = readFileSync(join(MEM, p), 'utf8');
+        const oldTxt = sh('git', ['-C', dir, 'show', `${head}:${p}`]);
+        const newTxt = readFileSync(join(dir, p), 'utf8');
         const ol = oldTxt.split('\n').length, nl = newTxt.split('\n').length;
         if (nl < ol * 0.5 || newTxt.trim().length < 80) viol.push(`vacio/recorto >50% el digest ${p} (${ol}->${nl} lineas)`);
       } catch { /* no se pudo comparar (digest nuevo, etc.): no bloquear por esto */ }
@@ -184,20 +184,20 @@ export function diffViolations(head, untrackedBefore) {
   }
   // 2) archivos nuevos (untracked) que cree el LLM (excluyendo los que ya tenia el humano)
   const before = new Set(untrackedBefore || []);
-  for (const p of listUntracked()) {
+  for (const p of listUntracked(dir)) {
     if (before.has(p)) continue; // del humano: no es del LLM, no se evalua aqui
     const { inInbox, inDigests, isRootMd } = classifyPath(p);
     if (inInbox || inDigests) continue; // permitido: nuevas notas movidas / nuevos digests
-    if (isRootMd && validV3Node(p)) continue; // permitido: nodo nuevo con frontmatter v3 valido
+    if (isRootMd && validV3Node(p, dir)) continue; // permitido: nodo nuevo con frontmatter v3 valido
     viol.push('creo archivo no-permitido ' + p);
   }
   return viol;
 }
 
 // valida frontmatter v3 minimo de un nodo nuevo en raiz (name==filename + claves obligatorias)
-function validV3Node(p) {
+function validV3Node(p, dir = MEM) {
   try {
-    const txt = readFileSync(join(MEM, p), 'utf8');
+    const txt = readFileSync(join(dir, p), 'utf8');
     const m = txt.match(/^---\r?\n([\s\S]*?)\r?\n---/);
     if (!m) return false;
     const fm = m[1];
@@ -211,9 +211,9 @@ function validV3Node(p) {
 }
 
 // lista de archivos untracked (un path por linea) segun git, relativos a MEM
-function listUntracked() {
+function listUntracked(dir = MEM) {
   try {
-    return sh('git', ['-C', MEM, '-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard'])
+    return sh('git', ['-C', dir, '-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard'])
       .split('\n').map(s => s.trim()).filter(Boolean);
   } catch { return []; }
 }
