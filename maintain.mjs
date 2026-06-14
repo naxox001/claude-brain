@@ -221,6 +221,20 @@ function run() {
     try { const dout = sh('node', [join(BRAIN, 'brain.mjs'), 'drain-inbox', '--mem', MEM]); if (!/vacio|no hay/.test(dout)) { log('drain-inbox:', dout.trim()); report.steps.drained = true; } } catch (e) { log('drain-inbox fallo:', e.message.slice(0, 60)); }
   }
 
+  // 2.8) PODA de inbox/.procesadas/ (Pieza 2 realtime): con captura intra-sesion (brain.mjs note) las notas
+  //      consumidas se acumulan mas rapido. Borramos las >30 dias. Son gitignored: no afecta el arbol.
+  if (!DRY) {
+    const proc = join(MEM, 'inbox', '.procesadas');
+    if (existsSync(proc)) {
+      let podadas = 0;
+      for (const f of readdirSync(proc)) {
+        const fp = join(proc, f);
+        try { if (lstatSync(fp).isFile() && (Date.now() - statSync(fp).mtimeMs) > 30 * 86400000) { rmSync(fp); podadas++; } } catch {}
+      }
+      if (podadas) { log(`poda inbox/.procesadas/: ${podadas} nota(s) consumida(s) >30d`); report.steps.podaProcesadas = podadas; }
+    }
+  }
+
   // 3) auto-demote cerrados >60d (solo si limpio)
   const demoted = [];
   if (treeClean) {

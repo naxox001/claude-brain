@@ -11,7 +11,7 @@
 //    las notas de inbox movidas. Preserva el WIP de otra sesion (NO usa reset --hard global). Alerta siempre.
 //  - Cada corrida exitosa = 1 commit git (auditable y revertible con git revert).
 // Uso: node consolidate.mjs [--dry-run]
-import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, cpSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, cpSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolveMem, BRAIN_DIR, HOME as CFG_HOME, acquireLock, releaseLock } from './brain.config.mjs';
@@ -32,6 +32,7 @@ function buildPrompt(digests) {
     `Hay notas crudas en ${INBOX}. Para cada una: decide a que dominio pertenece (digests disponibles: ${digests.join(', ')}),`,
     'integra su contenido al digest de ese dominio en memory/digests/<dominio>.md (seccion adecuada: Vigente ahora / Pendientes / Detalle), deduplicando.',
     'Si una nota es un PUNTERO DE SESION (_session_*.md con un transcript path): lee ese transcript y extrae SOLO memorias DURABLES (decisiones, lecciones reutilizables, hechos nuevos, cambios de estado de proyecto); descarta lo efimero/conversacional. Si no hay nada durable, no crees nada.',
+    'Si una nota es _note_*.md (captura intra-sesion): YA trae memoria durable curada — integrala directo al digest del dominio que corresponda, SIN abrir ningun transcript.',
     'Si una nota amerita un nodo propio, crea memory/<prefijo>_<slug>.md con frontmatter v3 (name==filename, domain, status, valid_from, importance). Usa node brain.mjs add si dudas del formato.',
     'REGLAS DURAS: NO edites MEMORY.md (es generado). NO borres ni reescribas cuerpos de nodos existentes. NO vacies ni recortes drasticamente un digest. NO toques nada fuera de memory/digests/ y memory/.',
     'Al terminar, mueve cada nota procesada de inbox/ a inbox/.procesadas/ (crea el dir). No borres las notas.',
@@ -39,10 +40,25 @@ function buildPrompt(digests) {
   ].join(' ');
 }
 
+// promueve las notas de staging _entrante_*.md a _note_*.md (Pieza 2). Se llama al INICIO de la corrida bajo
+// el lock: las _entrante_ que existian quedan listas para ESTE ciclo; las que nazcan despues no entran (siguen
+// como _entrante_ hasta el proximo). Idempotente y robusto: si ya existe el _note_ destino (dup), borra el _entrante_.
+export function drainEntrante(inbox = INBOX) {
+  let entr = [];
+  try { entr = readdirSync(inbox).filter(f => f.startsWith('_entrante_') && f.endsWith('.md')); } catch { return 0; }
+  let n = 0;
+  for (const f of entr) {
+    const src = join(inbox, f);
+    const target = join(inbox, f.replace(/^_entrante_/, '_note_'));
+    try { if (existsSync(target)) rmSync(src); else { renameSync(src, target); n++; } } catch { /* dejarla para el proximo ciclo */ }
+  }
+  return n;
+}
+
 function main() {
   if (!existsSync(INBOX)) { log('inbox/ no existe — nada que consolidar'); return; }
   if (DRY) {
-    const notes = readdirSync(INBOX).filter(f => f.endsWith('.md'));
+    const notes = readdirSync(INBOX).filter(f => f.endsWith('.md') && !f.startsWith('_entrante_'));
     if (!notes.length) { log('inbox/ vacio — no-op (no se invoca LLM)'); return; }
     log('DRY: invocaria claude -p con prompt de', buildPrompt([]).length, 'chars; luego validate + gate-diferencial + commit/rollback'); return;
   }
@@ -51,7 +67,12 @@ function main() {
   const lock = acquireLock();
   if (!lock) { log('otro job tiene el lock (.brain.lock fresco) — abort para no solapar'); return; }
   try {
-    const notes = readdirSync(INBOX).filter(f => f.endsWith('.md'));
+    // PROMOVER staging (Pieza 2): _entrante_*.md -> _note_*.md ANTES de fotografiar las notas, bajo el lock.
+    // Asi una nota escrita por note() DESPUES de este punto queda como _entrante_ y NO entra a ESTE ciclo
+    // (cierra la carrera de perdida que el rollback no cubriria).
+    const promovidas = drainEntrante();
+    if (promovidas) log(`staging: ${promovidas} nota(s) intra-sesion promovida(s) de _entrante_ a _note_`);
+    const notes = readdirSync(INBOX).filter(f => f.endsWith('.md') && !f.startsWith('_entrante_'));
     if (!notes.length) { log('inbox/ vacio — no-op (no se invoca LLM)'); return; }
     // GATE DE SEGURIDAD: nunca operar sobre un working tree sucio (WIP de otra sesion). En try/catch
     // (audit#5 #8): si MEM no es repo git o git esta ausente -> ABORT LIMPIO, no un crash con stack trace.

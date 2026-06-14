@@ -6,7 +6,8 @@
 
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { resolveMem } from './brain.config.mjs';
+import { execFileSync } from 'node:child_process';
+import { resolveMem, BRAIN_DIR } from './brain.config.mjs';
 import { parseFrontmatter, writeAtomic } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -211,6 +212,9 @@ function addNode() {
   writeFileSync(path, fm);
   console.log(`Creado nodo v3: ${path}`);
   console.log(`Edita el cuerpo y luego: node brain.mjs render-index`);
+  // Pieza 3-A (refresco al escribir): regenera el grafo SOLO contra el MEM real (sin --mem). Con --mem
+  // explicito (tests, otra memoria) NO se toca el grafo real. --no-graph lo desactiva. Best-effort.
+  if (memIdx < 0 && !args.includes('--no-graph')) refreshGraph();
 }
 
 // --- normalize: repara nodos con frontmatter no-v3 (ej. los que escribe la memory-tool nativa) ---
@@ -298,10 +302,60 @@ function capture() {
   process.exit(0);
 }
 
+// --- note: captura intra-sesion (Pieza 2 realtime). El agente graba una memoria durable YA CURADA al
+// instante, sin esperar al consolidador nocturno -> baja la latencia del INSUMO de ~24h a milisegundos.
+// Deposita una nota cruda _entrante_*.md en inbox/ (staging por PREFIJO, ya cubierto por el gitignore inbox/_*.md).
+// El consolidador la promueve a _note_*.md al inicio de su corrida (drainEntrante) y la integra a un digest.
+// Una nota nacida DURANTE la corrida del consolidador queda como _entrante_ y NO entra a ese ciclo (cierra la
+// carrera de perdida). Dedup por hash FNV-1a 64-bit del texto normalizado. CERO-LLM; no toca git/N0/digests.
+function fnv1a64(str) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(str, 'utf8')) { h = (h ^ BigInt(b)) * 0x100000001b3n & 0xffffffffffffffffn; }
+  return h.toString(16).padStart(16, '0');
+}
+function note() {
+  if (process.env.BRAIN_CONSOLIDATING) process.exit(0);  // anti-recursion (igual que capture): no auto-ingerir
+  const norm = p => String(p).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const cwdN = norm(process.cwd()), memN = norm(MEM);
+  if (cwdN && memN && (cwdN === memN || cwdN.startsWith(memN + '/'))) process.exit(0);  // cwd dentro de MEM = es el consolidador
+  const text = (flag('text') || flag('desc') || '').toString();
+  const domain = flag('domain') || '';
+  const normalized = text.trim().replace(/\s+/g, ' ').toLowerCase();
+  if (normalized.length < 24) { console.error('note: el texto durable debe tener al menos 24 caracteres utiles (recibido ' + normalized.length + '). Usa --text "<memoria durable>".'); process.exit(2); }
+  if (!existsSync(MEM)) { console.error('El dir de memoria no existe: ' + MEM); process.exit(2); }
+  const hash = fnv1a64(normalized);
+  const inbox = join(MEM, 'inbox'); if (!existsSync(inbox)) mkdirSync(inbox, { recursive: true });
+  // dedup idempotente: si ya hay una nota con este hash en inbox/ (entrante o _note_) o en .procesadas/, no-op
+  const sufijo = `_${hash}.md`;
+  for (const d of [inbox, join(inbox, '.procesadas')]) {
+    try { if (existsSync(d) && readdirSync(d).some(f => f.endsWith(sufijo))) { console.log('note: duplicada (hash ' + hash + ') — no-op'); process.exit(0); } } catch { /* dir ilegible: seguir */ }
+  }
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const dst = join(inbox, `_entrante_${stamp}${sufijo}`);
+  writeAtomic(dst, `# Nota durable in-session (${stamp})\n${domain ? '\ndominio sugerido: ' + domain + '\n' : ''}\nEsta nota YA trae memoria durable curada (NO es un puntero de sesion; no hay transcript que abrir): integrala al digest del dominio que corresponda.\n\n${text.trim()}\n`);
+  console.log('note: memoria durable depositada -> ' + dst);
+  process.exit(0);
+}
+
+// --- refresh-graph: regenera el grafo derivado (graph.db + visor/graph.json) desde el markdown actual.
+// Pieza 3-A (refresco al escribir): lo invoca add() tras crear un nodo (solo contra el MEM real), y se puede
+// correr a mano tras editar nodos para que el visor/query queden frescos sin esperar a un job. Best-effort.
+function refreshGraph() {
+  const outIdx = args.indexOf('--out');  // forward --out si se da (default = BRAIN_DIR, donde el visor lee)
+  const extraOut = outIdx >= 0 && args[outIdx + 1] ? ['--out', args[outIdx + 1]] : [];
+  try {
+    execFileSync(process.execPath, [join(BRAIN_DIR, 'graph.mjs'), 'build', '--mem', MEM, ...extraOut], { stdio: 'ignore' });
+    execFileSync(process.execPath, [join(BRAIN_DIR, 'graph.mjs'), 'export-3d', '--mem', MEM, ...extraOut], { stdio: 'ignore' });
+    console.log('grafo refrescado (graph.db + visor/graph.json)');
+  } catch (e) { console.error('refresh-graph: fallo (no fatal, el grafo es derivado):', (e.message || '').slice(0, 80)); }
+}
+
 if (cmd === 'render-index') renderIndex();
 else if (cmd === 'validate') validate();
 else if (cmd === 'add') addNode();
 else if (cmd === 'normalize') normalize();
 else if (cmd === 'drain-inbox') drainInbox();
 else if (cmd === 'capture') capture();
-else { console.error('Uso: node brain.mjs <render-index|validate|add|normalize|drain-inbox|capture> [--mem <dir>] [--dry-run]'); process.exit(2); }
+else if (cmd === 'note') note();
+else if (cmd === 'refresh-graph') refreshGraph();
+else { console.error('Uso: node brain.mjs <render-index|validate|add|normalize|drain-inbox|capture|note|refresh-graph> [--mem <dir>] [--dry-run]'); process.exit(2); }

@@ -480,3 +480,79 @@ test('maintain: demote mueve cerrados >60d a archivo/ y deja los recientes (#2/G
   assert.ok(existsSync(join(mem, 'nuevo_cerrado.md')) && !existsSync(join(mem, 'archivo', 'nuevo_cerrado.md')), 'el cerrado RECIENTE debe quedarse');
   rmSync(d, { recursive: true, force: true });
 });
+
+// === REALTIME Pieza 2 (captura intra-sesion) + Pieza 3-A (refresco al escribir) ===
+
+test('note: deposita _entrante_ durable, dedup por hash, rechaza corto, guard anti-recursion (Pieza 2)', () => {
+  const { d, mem } = tmpMem();
+  const inbox = join(mem, 'inbox');
+  const txt = 'Decision durable: el consolidador usa git merge-file para fusionar digests sin pisar WIP humano';
+  assert.equal(run(['brain.mjs', 'note', '--mem', mem, '--text', txt]).code, 0);
+  let entr = readdirSync(inbox).filter(f => f.startsWith('_entrante_') && f.endsWith('.md'));
+  assert.equal(entr.length, 1, 'crea una nota _entrante_');
+  assert.match(readFileSync(join(inbox, entr[0]), 'utf8'), /merge-file/, 'contiene el texto durable');
+  // dedup: la misma nota no duplica
+  run(['brain.mjs', 'note', '--mem', mem, '--text', txt]);
+  assert.equal(readdirSync(inbox).filter(f => f.startsWith('_entrante_')).length, 1, 'dedup: no duplica');
+  // texto corto -> exit 2
+  assert.equal(run(['brain.mjs', 'note', '--mem', mem, '--text', 'corto']).code, 2, 'rechaza <24 chars utiles');
+  // guard BRAIN_CONSOLIDATING -> no-op (no deposita)
+  const antes = readdirSync(inbox).length;
+  execFileSync(NODE, ['brain.mjs', 'note', '--mem', mem, '--text', 'otra decision durable distinta para el guard'], { cwd: HERE, encoding: 'utf8', env: { ...process.env, BRAIN_CONSOLIDATING: '1' } });
+  assert.equal(readdirSync(inbox).length, antes, 'BRAIN_CONSOLIDATING: no deposita (anti-recursion)');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('note: NO ejecuta git (no commitea ni revierte WIP) (Pieza 2)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-note-git-'));
+  const mem = join(d, 'mem'); mkdirSync(mem, { recursive: true });
+  const g = (...a) => execFileSync('git', ['-C', mem, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g('init', '-q'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
+  writeFileSync(join(mem, 'seed.md'), 'original'); g('add', '-A'); g('commit', '-q', '-m', 'i');
+  const head1 = g('rev-parse', 'HEAD').trim();
+  writeFileSync(join(mem, 'seed.md'), 'WIP humano sin commitear');  // WIP tracked sucio
+  run(['brain.mjs', 'note', '--mem', mem, '--text', 'una decision durable que NO debe tocar el git en absoluto ok']);
+  assert.equal(g('rev-parse', 'HEAD').trim(), head1, 'note no commitea');
+  assert.match(readFileSync(join(mem, 'seed.md'), 'utf8'), /WIP humano/, 'note no revierte el WIP');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('consolidate.drainEntrante: promueve _entrante_ a _note_ bajo el lock (Pieza 2)', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-entr-'));
+  const inbox = join(d, 'mem', 'inbox'); mkdirSync(inbox, { recursive: true });
+  writeFileSync(join(inbox, '_entrante_2026-01-01-00-00-00_abc123.md'), 'nota durable');
+  writeFileSync(join(inbox, '_note_2026-01-01-00-00-00_dup.md'), 'ya promovida');  // un _note_ que no debe tocarse
+  process.env.BRAIN_MEM = join(d, 'mem');
+  const C = await import('./consolidate.mjs');
+  delete process.env.BRAIN_MEM;
+  const n = C.drainEntrante(inbox);  // dir explicito (evita el cache del modulo)
+  assert.equal(n, 1, 'promueve 1');
+  assert.ok(existsSync(join(inbox, '_note_2026-01-01-00-00-00_abc123.md')), 'renombra _entrante_ -> _note_');
+  assert.ok(!existsSync(join(inbox, '_entrante_2026-01-01-00-00-00_abc123.md')), 'el _entrante_ ya no esta');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('refresh-graph: regenera el grafo derivado contra --out (Pieza 3-A)', () => {
+  const { d, mem } = tmpMem();
+  const out = join(d, 'gout');
+  const r = run(['brain.mjs', 'refresh-graph', '--mem', mem, '--out', out]);
+  assert.equal(r.code, 0, r.out);
+  assert.ok(existsSync(join(out, 'visor', 'graph.json')), 'genera visor/graph.json');
+  assert.ok(existsSync(join(out, 'derived', 'graph.db')), 'genera derived/graph.db');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('maintain: poda inbox/.procesadas/ >30d, deja las recientes (Pieza 2)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-prune-'));
+  const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
+  writeFileSync(join(mem, 'digests', 'web.md'), '---\nname: digest-web\ndescription: d\nmetadata: { type: reference, domain: web, status: vigente, valid_from: 2026-01-01, digest: true }\n---\n# D\n## Vigente ahora\nok\n');
+  const proc = join(mem, 'inbox', '.procesadas'); mkdirSync(proc, { recursive: true });
+  writeFileSync(join(proc, 'vieja.md'), 'consumida hace tiempo');
+  writeFileSync(join(proc, 'reciente.md'), 'consumida ahora');
+  const old = (Date.now() - 40 * 86400000) / 1000; utimesSync(join(proc, 'vieja.md'), old, old);
+  const env = { ...process.env, USERPROFILE: d, HOME: d, BRAIN_BACKUP: join(d, 'backup') };
+  run2(['maintain.mjs', '--mem', mem], env);
+  assert.ok(!existsSync(join(proc, 'vieja.md')), 'la nota consumida >30d debe podarse');
+  assert.ok(existsSync(join(proc, 'reciente.md')), 'la reciente debe quedarse');
+  rmSync(d, { recursive: true, force: true });
+});
