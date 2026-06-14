@@ -35,7 +35,8 @@ try { await import('node:sqlite'); log('preflight: node', process.versions.node,
 catch { console.error('node:sqlite no disponible en este Node'); process.exit(1); }
 
 // 2) config
-W(join(HOME, '.claude', 'brain.json'), JSON.stringify({ memDir: MEM.replace(/\\/g, '/'), note: 'Config del cerebro. memDir = capa markdown soberana.' }, null, 2) + '\n');
+// brainDir (audit#6 #13/#19): los hooks .sh lo leen para ubicar el codigo sin hardcodear ~/projects/claude-brain.
+W(join(HOME, '.claude', 'brain.json'), JSON.stringify({ memDir: MEM.replace(/\\/g, '/'), brainDir: HERE.replace(/\\/g, '/'), note: 'Config del cerebro. memDir = capa markdown soberana; brainDir = repo de codigo.' }, null, 2) + '\n');
 log('config -> ~/.claude/brain.json');
 
 // 3) hooks portables: SessionStart (health-check) + Stop (productor del lazo)
@@ -84,6 +85,17 @@ if (!existsSync(MEM)) {
       log('derivados generados + validate OK');
     } catch (e) { console.error('fallo generando derivados:', e.message.slice(0, 100)); }
   } else log('derivados: (dry)');
+  // .gitignore del MEM (audit#6 #23): el rollback/no-op del consolidador ASUME que los depositos de inbox/ estan
+  // gitignored (si no, ensucian el arbol y disparan el gate). Aseguramos los patrones, idempotente (solo si faltan).
+  if (!DRY) {
+    const giPath = join(MEM, '.gitignore');
+    const want = ['inbox/_*.md', 'inbox/.procesadas/'];
+    const cur = existsSync(giPath) ? readFileSync(giPath, 'utf8') : '';
+    const have = cur.split('\n').map(s => s.trim());
+    const missing = want.filter(w => !have.includes(w));
+    if (missing.length) { writeFileSync(giPath, (cur && !cur.endsWith('\n') ? cur + '\n' : cur) + missing.join('\n') + '\n'); log('.gitignore de MEM: +' + missing.length + ' patron(es) de inbox/'); }
+    else log('.gitignore de MEM: ya cubre los depositos de inbox/');
+  }
 }
 
 // 6.5) GENERAR run-*.cmd con el node path de ESTA maquina (fix audit 2026-06-13: no versionar rutas ajenas) + logs/

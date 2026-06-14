@@ -7,6 +7,9 @@ set +e
 
 CFG="$HOME/.claude/brain.json"
 BRAIN="$HOME/projects/claude-brain"
+# BRAIN portable (audit#6 #13/#19): leer brainDir de brain.json (lo escribe install.mjs) con fallback al default,
+# para que el hook funcione aunque el repo de codigo se haya clonado en otra ruta (consistente con BRAIN_DIR del .mjs).
+[ -f "$CFG" ] && B=$(grep -o '"brainDir"[^,}]*' "$CFG" | sed -E 's/.*"brainDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/') && [ -n "$B" ] && BRAIN="$B"
 MEM_DIR=""
 # [[:space:]] en vez de \s (audit#5 #21): \s no es clase en BSD sed (macOS) -> ahi no matcheaba y devolvia la linea entera.
 [ -f "$CFG" ] && MEM_DIR=$(grep -o '"memDir"[^,}]*' "$CFG" | sed -E 's/.*"memDir"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')

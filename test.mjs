@@ -451,6 +451,18 @@ test('install.mjs --dry-run corre limpio y --home sin valor aborta (cobertura ba
   rmSync(d, { recursive: true, force: true });
 });
 
+test('install: escribe brainDir en brain.json y asegura el .gitignore del MEM (#13/#19/#23)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'brain-install2-'));
+  const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
+  writeFileSync(join(mem, 'digests', 'web.md'), '---\nname: digest-web\ndescription: d\nmetadata: { type: reference, domain: web, status: vigente, valid_from: 2026-01-01, digest: true }\n---\n# D\n## Vigente ahora\nok\n');
+  const r = run(['install.mjs', '--home', join(d, 'home'), '--mem', mem, '--skip-tasks']);
+  assert.equal(r.code, 0, r.out);
+  const cfg = JSON.parse(readFileSync(join(d, 'home', '.claude', 'brain.json'), 'utf8'));
+  assert.ok(cfg.brainDir, 'brain.json debe incluir brainDir (portabilidad de los hooks): ' + JSON.stringify(cfg));
+  assert.match(readFileSync(join(mem, '.gitignore'), 'utf8'), /inbox\/_\*\.md/, 'el .gitignore del MEM debe cubrir los depositos de inbox/');
+  rmSync(d, { recursive: true, force: true });
+});
+
 test('maintain: demote mueve cerrados >60d a archivo/ y deja los recientes (#2/G2)', () => {
   const d = mkdtempSync(join(tmpdir(), 'brain-maint-'));
   const mem = join(d, 'mem'); mkdirSync(join(mem, 'digests'), { recursive: true });
