@@ -383,6 +383,38 @@ test('consolidate: el spawn de claude -p conserva los flags de seguridad (anti S
   assert.match(src, /stdio:\s*'ignore'/, "el stdout del LLM no debe heredarse al log");
 });
 
+test('consolidate: buildClaudeInvocation apaga el thinking + modelo rapido + sin MCP (fix ETIMEDOUT 2026-06-18)', () => {
+  // CAUSA RAIZ del ETIMEDOUT: el `claude -p` heredaba Opus[1m] + effortLevel xhigh + alwaysThinking + ~27 MCP
+  // -> thinking masivo que NUNCA convergia a las ediciones dentro del timeout (ni 600s). Se verifica en
+  // SUBPROCESO: importar consolidate.mjs en el proceso principal fijaria su MEM module-level y romperia el
+  // aislamiento de otros tests (p.ej. diffViolations, que lo carga con un BRAIN_MEM temporal).
+  const dd = mkdtempSync(join(tmpdir(), 'brain-inv-'));
+  const drvPath = join(dd, 'd.mjs');
+  writeFileSync(drvPath, [
+    `import { buildClaudeInvocation } from ${JSON.stringify(pathToFileURL(join(HERE, 'consolidate.mjs')).href)};`,
+    `const { args, opts } = buildClaudeInvocation('/tmp/WT', 'PROMPT-X');`,
+    `process.stdout.write(JSON.stringify({ args, stdio: opts.stdio, timeout: opts.timeout, cwd: opts.cwd, MAX: opts.env.MAX_THINKING_TOKENS, CONS: opts.env.BRAIN_CONSOLIDATING, MEM: opts.env.BRAIN_MEM }));`,
+  ].join('\n'));
+  const r = run([drvPath]);
+  assert.equal(r.code, 0, 'el driver corre: ' + r.out);
+  const o = JSON.parse(r.out);
+  const mi = o.args.indexOf('--model');
+  assert.ok(mi >= 0 && o.args[mi + 1] === 'haiku', 'modelo explicito default=haiku (no heredar Opus[1m]): ' + r.out);
+  assert.ok(o.args.includes('--strict-mcp-config'), 'sin MCP del usuario (--strict-mcp-config)');
+  assert.equal(o.MAX, '0', 'thinking APAGADO (MAX_THINKING_TOKENS=0) — fix decisivo del cuelgue');
+  assert.ok(o.args.includes('--permission-mode') && o.args.includes('--allowedTools') && o.args.includes('--disallowedTools'), 'flags de seguridad preservados');
+  assert.ok(o.args.includes('Bash,WebFetch,WebSearch'), 'denylist Bash/red preservada');
+  assert.equal(o.args[o.args.length - 2], '-p', 'el prompt va con -p (ultimo)');
+  assert.equal(o.stdio, 'ignore', 'stdio ignore'); assert.equal(o.timeout, 600000, 'timeout 600s');
+  assert.equal(o.CONS, '1', 'BRAIN_CONSOLIDATING=1'); assert.equal(o.MEM, '/tmp/WT', 'BRAIN_MEM=WT');
+  // modelo configurable por env (override)
+  const r2 = run2([drvPath], { ...process.env, BRAIN_LLM_MODEL: 'sonnet' });
+  assert.equal(JSON.parse(r2.out).args[JSON.parse(r2.out).args.indexOf('--model') + 1], 'sonnet', 'BRAIN_LLM_MODEL override el modelo');
+  // el prompt NO debe invitar a Bash (node brain.mjs add) — Bash esta en disallowedTools (evita vuelta desperdiciada)
+  assert.ok(!/brain\.mjs add/.test(readFileSync(join(HERE, 'consolidate.mjs'), 'utf8')), 'el prompt no invita a Bash');
+  rmSync(dd, { recursive: true, force: true });
+});
+
 test('acquireLock: lock vacio FRESCO no se reclama (ventana de doble-adquisicion); vacio VIEJO si (#14)', () => {
   const name = '.brain-test-empty.lock';
   const lp = join(BRAIN_DIR, name);

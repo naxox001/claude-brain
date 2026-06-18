@@ -34,7 +34,7 @@ function buildPrompt(digests, inboxPath = INBOX) {
     // Rutas RELATIVAS al cwd (=WT, la raiz de la capa de memoria); no hay subdir 'memory/' aqui (fix audit round-3).
     'integra su contenido al digest de ese dominio en digests/<dominio>.md (seccion adecuada: Vigente ahora / Pendientes / Detalle), deduplicando.',
     'Las notas son CURADAS (_note_*.md / _pending_*.md): memoria durable lista para integrar. Los _session_*.md NO llegan aca (el consolidador los archiva sin leer; episodic-memory es el indexador conversacional). NUNCA abras un transcript .jsonl. Integra cada nota directo al digest del dominio que corresponda.',
-    'Si una nota amerita un nodo propio, crea <prefijo>_<slug>.md en la raiz con frontmatter v3 (name==filename, domain, status, valid_from, importance). Usa node brain.mjs add si dudas del formato.',
+    'Si una nota amerita un nodo propio, crea <prefijo>_<slug>.md en la raiz con frontmatter v3 (name==filename, domain, status, valid_from, importance). Si dudas del formato, copia el patron de un nodo .md existente en la raiz.',
     'REGLAS DURAS: NO edites MEMORY.md (es generado). NO borres ni reescribas cuerpos de nodos existentes. NO vacies ni recortes drasticamente un digest. NO toques nada fuera de digests/ y la raiz del repo (tu cwd).',
     'Al terminar, mueve cada nota procesada de inbox/ a inbox/.procesadas/ (crea el dir). No borres las notas.',
     'Se conservador: ante la duda, deja la nota en inbox/ sin tocar y registra por que.',
@@ -164,6 +164,26 @@ function main() {
   } finally { releaseLock(lock); }
 }
 
+// buildClaudeInvocation — arma el comando de `claude -p` del consolidador. Extraido para test + para BLINDAR el
+// fix del cuelgue (2026-06-18, hallado por debug sistematico): el `claude -p` headless HEREDABA la config
+// INTERACTIVA de la maquina (model Opus[1m] + effortLevel xhigh + alwaysThinking + ~27 MCP servers), lo que
+// disparaba un razonamiento (thinking) que NUNCA convergia a las ediciones dentro del timeout (ni en 600s) ->
+// `spawnSync claude ETIMEDOUT` en cada corrida, sin integrar nada. El fix:
+//   --model <rapido>      : NO heredar Opus[1m]; default 'haiku' (rapido/barato, calidad verificada en repro),
+//                           override por BRAIN_LLM_MODEL (p.ej. 'sonnet').
+//   --strict-mcp-config   : no cargar los MCP del usuario (decenas de connectors inutiles para consolidar texto).
+//   MAX_THINKING_TOKENS=0 : APAGA el thinking extendido (la causa raiz). Decisivo.
+// Mantiene los flags de seguridad (permission-mode acotado + allow/deny tools) y stdio:'ignore'.
+export function buildClaudeInvocation(WT, prompt) {
+  const model = process.env.BRAIN_LLM_MODEL || 'haiku';
+  return {
+    args: ['--model', model, '--strict-mcp-config', '--permission-mode', 'default',
+      '--allowedTools', 'Read,Edit,Write,Glob,Grep', '--disallowedTools', 'Bash,WebFetch,WebSearch', '-p', prompt],
+    opts: { cwd: WT, timeout: 600000, stdio: 'ignore',
+      env: { ...process.env, BRAIN_CONSOLIDATING: '1', BRAIN_MEM: WT, MAX_THINKING_TOKENS: '0' } },
+  };
+}
+
 // runConsolidation: corre el LLM en un worktree AISLADO, valida ahi, y fusiona los digests de vuelta al MEM
 // preservando el WIP humano. llmStep inyectable (tests): si se pasa, reemplaza el spawn de 'claude' (recibe el WT).
 export function runConsolidation(notes, llmStep) {
@@ -179,8 +199,8 @@ export function runConsolidation(notes, llmStep) {
       else {
         const prompt = buildPrompt(digestsOf(WT), join(WT, 'inbox'));
         log('invocando claude -p (headless) en worktree…');
-        sh('claude', ['--permission-mode', 'default', '--allowedTools', 'Read,Edit,Write,Glob,Grep', '--disallowedTools', 'Bash,WebFetch,WebSearch', '-p', prompt],
-          { cwd: WT, timeout: 600000, stdio: 'ignore', env: { ...process.env, BRAIN_CONSOLIDATING: '1', BRAIN_MEM: WT } });
+        const inv = buildClaudeInvocation(WT, prompt);
+        sh('claude', inv.args, inv.opts);
       }
     } catch (e) { log('claude -p fallo o timeout — se descarta el worktree (nada en el MEM):', (e.message || '').slice(0, 70)); alert('consolidador: claude -p fallo o timeout (revisar login/creditos/red)'); return; }
 
