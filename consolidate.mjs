@@ -33,8 +33,7 @@ function buildPrompt(digests, inboxPath = INBOX) {
     `Hay notas crudas en ${inboxPath}. Para cada una: decide a que dominio pertenece (digests disponibles: ${digests.join(', ')}),`,
     // Rutas RELATIVAS al cwd (=WT, la raiz de la capa de memoria); no hay subdir 'memory/' aqui (fix audit round-3).
     'integra su contenido al digest de ese dominio en digests/<dominio>.md (seccion adecuada: Vigente ahora / Pendientes / Detalle), deduplicando.',
-    'Si una nota es un PUNTERO DE SESION (_session_*.md con un transcript path): lee ese transcript y extrae SOLO memorias DURABLES (decisiones, lecciones reutilizables, hechos nuevos, cambios de estado de proyecto); descarta lo efimero/conversacional. Si no hay nada durable, no crees nada.',
-    'Si una nota es _note_*.md (captura intra-sesion): YA trae memoria durable curada — integrala directo al digest del dominio que corresponda, SIN abrir ningun transcript.',
+    'Las notas son CURADAS (_note_*.md / _pending_*.md): memoria durable lista para integrar. Los _session_*.md NO llegan aca (el consolidador los archiva sin leer; episodic-memory es el indexador conversacional). NUNCA abras un transcript .jsonl. Integra cada nota directo al digest del dominio que corresponda.',
     'Si una nota amerita un nodo propio, crea <prefijo>_<slug>.md en la raiz con frontmatter v3 (name==filename, domain, status, valid_from, importance). Usa node brain.mjs add si dudas del formato.',
     'REGLAS DURAS: NO edites MEMORY.md (es generado). NO borres ni reescribas cuerpos de nodos existentes. NO vacies ni recortes drasticamente un digest. NO toques nada fuera de digests/ y la raiz del repo (tu cwd).',
     'Al terminar, mueve cada nota procesada de inbox/ a inbox/.procesadas/ (crea el dir). No borres las notas.',
@@ -147,10 +146,21 @@ function main() {
     try { sh('git', ['-C', MEM, 'rev-parse', 'HEAD']); } catch { log('MEM no es repo git o sin commits — ABORT (no tocar)'); return; }
     recoverFromSentinel();   // limpia una consolidacion crasheada previa (idempotencia)
     drainEntrante();         // promueve _entrante_ -> _note_ bajo el lock (Pieza 2)
-    const notes = readdirSync(INBOX).filter(f => f.endsWith('.md') && !f.startsWith('_entrante_'));
-    if (!notes.length) { log('inbox/ vacio — no-op (no se invoca LLM)'); return; }
-    log(`inbox: ${notes.length} nota(s) -> ${notes.join(', ')}`);
-    runConsolidation(notes, null);
+    const allNotes = readdirSync(INBOX).filter(f => f.endsWith('.md') && !f.startsWith('_entrante_'));
+    if (!allNotes.length) { log('inbox/ vacio — no-op (no se invoca LLM)'); return; }
+    // Opcion A (fix 2026-06-18): los _session_*.md son PUNTEROS a transcripts .jsonl de hasta ~28MB que
+    // NO caben en la ventana de claude -p (causaba ETIMEDOUT en cada corrida, sin progreso). episodic-memory
+    // ya es el unico indexador conversacional -> los _session se ARCHIVAN sin re-leer; al LLM solo van las
+    // notas CURADAS (_note/_pending), que ya son memoria durable lista para integrar.
+    const sessionNotes = allNotes.filter(f => f.startsWith('_session_'));
+    const curated = allNotes.filter(f => !f.startsWith('_session_'));
+    if (sessionNotes.length) {
+      drainReal(sessionNotes);
+      log(`archivadas ${sessionNotes.length} nota(s) _session sin leer (episodic-memory las indexa)`);
+    }
+    if (!curated.length) { log('sin notas curadas (_note/_pending) — no-op (no se invoca LLM)'); return; }
+    log(`inbox: ${curated.length} nota(s) curada(s) -> ${curated.join(', ')}`);
+    runConsolidation(curated, null);
   } finally { releaseLock(lock); }
 }
 
